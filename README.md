@@ -7,12 +7,13 @@ An intelligent WhatsApp collector bot for **BUYSELL Nigeria** powered by **Groq 
 ## 🌟 Key Features
 
 - **Multimodal Visual AI Analysis:** Even if a seller posts an image with **no description** or only a price tag (e.g. `330k`, `₦45,000`, `price: 50k`), the Vision AI inspects the photo, detects the exact item (brand, model, category, specs, condition), and crafts a rich title and description.
-- **Price Extraction:** Automatically extracts Nigerian price formats (`350k` -> ₦350,000, `1.5m` -> ₦1,500,000, `₦45,000`) from message text, follow-up messages, or visible price tags/flyers in the photo.
-- **Smart Follow-Up Buffering:** If a seller posts photos first and sends the price a few seconds later, the bot buffers the photos for up to 30 seconds, joins them with the price, and processes them as one complete listing.
-- **Note Merging:** If the seller leaves short notes (e.g. `UK used, battery 88%`), the bot seamlessly merges the seller's notes with the AI's visual product description.
+- **Multi-Product Processing:** When a seller posts multiple products at once (via catalog price lists, albums, or successive captioned photos), Bot 2 detects and extracts each product individually and ingests them with distinct indexed IDs instead of squashing them into one item.
+- **Clean Descriptions (No Embedded Prices):** Descriptions and titles never include the price, currency signs, or payment figures, ensuring clean product descriptions on the marketplace.
+- **20% Dynamic Markup:** Marketplace price automatically includes a 20% platform markup on top of the seller's source price.
+- **Smart Follow-Up Buffering:** If a seller posts photos first and sends the price a few seconds later, the bot buffers the photos, joins them with the follow-up price, and processes them as one complete listing.
 - **Cloudinary Image Hosting:** Automatically optimizes and uploads WhatsApp images directly to Cloudinary.
 - **Direct Marketplace Ingestion:** Publishes approved listings straight into the BUYSELL Supabase catalog.
-- **Interactive Seller Feedback:** Automatically DMs the seller with their public link and management controls (replying `SOLD` or `DELETE` marks the item sold).
+- **Consolidated Seller Feedback:** Automatically DMs the seller with a consolidated summary of their uploaded products and management links (replying `SOLD` or `DELETE` marks the latest listing sold).
 - **Keep-Alive Health Check:** Built-in HTTP server on `PORT` for 24/7 uptime monitoring with UptimeRobot.
 
 ---
@@ -47,7 +48,7 @@ PUBLIC_SITE_URL=https://your-buysell-site.com
 
 ## 🚀 Deployment (Render)
 
-1. Create a new **Web Service** on Render and connect this repository:
+1. Create a new **Web Service** on Render and connect this repository (`https://github.com/israel2002551/buysell_bot2.git`):
    - **Runtime:** `Node`
    - **Build Command:** `npm install`
    - **Start Command:** `npm start`

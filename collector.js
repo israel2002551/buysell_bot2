@@ -12,10 +12,10 @@ import http from 'node:http';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import 'dotenv/config';
-import { parseListingWithVision, looksLikeSalePost } from './parser.js';
+import { parseListingWithVision, looksLikeSalePost, stripPriceFromText, hasPriceInText } from './parser.js';
 import { uploadWhatsAppMedia } from './cloudinary.js';
 import { BuySellListingsApi } from './buysell-api.js';
-import { sendSellerCommandResult, sendSellerConfirmation } from './notifier.js';
+import { sendSellerCommandResult, sendSellerConfirmation, sendSellerBatchConfirmation } from './notifier.js';
 
 const api = new BuySellListingsApi();
 const targetGroups = new Set();
@@ -64,7 +64,7 @@ function saveMessage(message) {
 // Multi-message buffering for photos and follow-up prices / descriptions
 const pendingBundles = new Map();
 const recentUncaptionedMedia = new Map();
-const bundleWindowMs = 5_000;
+const bundleWindowMs = 4_000;
 
 async function refreshTargetGroups(force = false) {
   const now = Date.now();
@@ -127,10 +127,10 @@ function mediaDetails(message) {
   return null;
 }
 
-function sourceId(groupJid, senderJid, messageIds) {
+function sourceId(groupJid, senderJid, messageIds, index = 0) {
   const identifiers = [...new Set((messageIds || []).filter(Boolean))].sort().join('|');
   const digest = createHash('sha256').update(`${groupJid}|${senderJid}|${identifiers}`).digest('hex');
-  return `wa_vis_${digest}`;
+  return index > 0 ? `wa_vis_${digest}_${index}` : `wa_vis_${digest}`;
 }
 
 function rawPhone(senderJid) {
@@ -144,7 +144,7 @@ async function processListing(bundle, sock) {
   if (!looksLikeSalePost(bundle.text, hasImages)) return;
 
   console.info(`[Vision Analysis] Scanning post from ${bundle.senderJid} (images: ${bundle.media?.length || 0}, text: "${(bundle.text || '').slice(0, 50).replace(/\n/g, ' ')}")...`);
-  
+
   const parsed = await parseListingWithVision({
     text: bundle.text,
     media: bundle.media,
@@ -154,68 +154,161 @@ async function processListing(bundle, sock) {
     console.info(`[Skipped] ${bundle.senderJid}: Vision AI determined this is not a commercial sale post.`);
     return;
   }
-  if (!Number.isFinite(Number(parsed.price)) || Number(parsed.price) <= 0) {
-    console.info(`[Skipped] ${bundle.senderJid}: A fixed price was not found in post text or image.`);
+
+  // Extract all valid items parsed from this post
+  const rawItems = Array.isArray(parsed.items) && parsed.items.length > 0
+    ? parsed.items
+    : (parsed.title && parsed.price ? [parsed] : []);
+
+  const validItems = rawItems.filter(item => Number.isFinite(Number(item?.price)) && Number(item.price) > 0);
+
+  if (validItems.length === 0) {
+    console.info(`[Skipped] ${bundle.senderJid}: No priced products found in post text or image.`);
     return;
   }
 
-  const id = sourceId(bundle.groupJid, bundle.senderJid, bundle.messageIds);
+  console.info(`[Vision Found] Detected ${validItems.length} product(s) from ${bundle.senderJid}`);
+
+  // Base identifier for Cloudinary uploads
+  const baseId = sourceId(bundle.groupJid, bundle.senderJid, bundle.messageIds, 0);
+
+  let uploadedMedia = [];
   try {
-    const media = await Promise.all((bundle.media || []).map((item, index) => uploadWhatsAppMedia({
+    uploadedMedia = await Promise.all((bundle.media || []).map((item, index) => uploadWhatsAppMedia({
       buffer: item.buffer,
       kind: item.kind,
       mimeType: item.mimeType,
-      sourceId: id,
+      sourceId: baseId,
       index,
     })));
+  } catch (err) {
+    console.error(`[Vision Cloudinary upload] ${bundle.senderJid}:`, err?.message || err);
+  }
 
-    // Use AI vision-generated title and description, merging seller text if provided
-    const finalTitle = parsed.title || 'Marketplace Item';
-    let finalDescription = parsed.description || bundle.text || finalTitle;
-    if (bundle.text && bundle.text.trim() && parsed.description && !parsed.description.includes(bundle.text.trim())) {
-      finalDescription = `${parsed.description}\n\nSeller note: ${bundle.text.trim()}`;
+  const createdListings = [];
+
+  // Ingest each identified product separately
+  for (let i = 0; i < validItems.length; i++) {
+    const item = validItems[i];
+    const itemSourceId = sourceId(bundle.groupJid, bundle.senderJid, bundle.messageIds, i);
+
+    // Ensure title and description never contain the price
+    const finalTitle = stripPriceFromText(item.title) || 'Marketplace Item';
+    const finalDescription = stripPriceFromText(item.description) || finalTitle;
+
+    // Map media: if multiple products and multiple images, assign respective image; otherwise all media
+    let itemMedia = uploadedMedia;
+    if (validItems.length > 1 && uploadedMedia.length > 1) {
+      const targetIdx = Number.isInteger(item.image_index) && item.image_index >= 0 && item.image_index < uploadedMedia.length
+        ? item.image_index
+        : (i < uploadedMedia.length ? i : 0);
+      itemMedia = [uploadedMedia[targetIdx]].filter(Boolean);
     }
 
     const manageToken = randomBytes(32).toString('base64url');
-    const listing = await api.ingest({
-      source_message_id: id,
-      group_jid: bundle.groupJid,
-      sender_jid: bundle.senderJid,
-      sender_phone: parsed.seller_phone || rawPhone(bundle.senderJid),
-      manage_token: manageToken,
-      title: finalTitle,
-      description: finalDescription,
-      price: Number(parsed.price),
-      category: parsed.category,
-      condition: parsed.condition,
-      brand: parsed.brand,
-      location: parsed.location,
-      specs: parsed.specs,
-      negotiable: false,
-      media,
-      seller_id: process.env.WHATSAPP_LISTINGS_SELLER_ID || 'e525b6d9-4f81-4522-822d-119151671dba',
-    });
 
-    if (!listing.created) {
-      console.info(`[Deduplicated] ${id}`);
-      return;
+    try {
+      const listing = await api.ingest({
+        source_message_id: itemSourceId,
+        group_jid: bundle.groupJid,
+        sender_jid: bundle.senderJid,
+        sender_phone: parsed.seller_phone || rawPhone(bundle.senderJid),
+        manage_token: manageToken,
+        title: finalTitle,
+        description: finalDescription,
+        price: Number(item.price),
+        category: item.category,
+        condition: item.condition,
+        brand: item.brand,
+        location: item.location || parsed.location,
+        specs: item.specs,
+        negotiable: false,
+        media: itemMedia,
+        seller_id: process.env.WHATSAPP_LISTINGS_SELLER_ID || 'e525b6d9-4f81-4522-822d-119151671dba',
+      });
+
+      if (!listing?.created) {
+        console.info(`[Deduplicated] ${itemSourceId}`);
+        continue;
+      }
+
+      console.info(`[Vision Imported] Product #${i + 1}/${validItems.length} (${listing.product_id}): ${listing.product?.name || finalTitle} (₦${Number(item.price).toLocaleString()})`);
+      createdListings.push({ listing, manageToken, item, finalTitle });
+
+      // Pacing delay between ingesting each product to avoid DB/rate-limit spikes
+      if (i < validItems.length - 1) {
+        await new Promise(r => setTimeout(r, 600));
+      }
+    } catch (error) {
+      console.error(`[Vision Product import failed] ${bundle.senderJid} (${finalTitle}):`, error?.message || error);
     }
-    console.info(`[Vision Imported] ${listing.product_id}: ${listing.product?.name || finalTitle} (₦${Number(parsed.price).toLocaleString()})`);
-    
-    await sendSellerConfirmation(sock, {
+  }
+
+  // Notify seller of imported listing(s)
+  if (createdListings.length > 0) {
+    await sendSellerBatchConfirmation(sock, {
       senderJid: bundle.senderJid,
-      listing,
-      manageToken,
+      listings: createdListings,
       publicSiteUrl: process.env.PUBLIC_SITE_URL,
     });
-  } catch (error) {
-    console.error(`[Vision Listing import] ${bundle.senderJid}:`, error?.message || error);
   }
+}
+
+async function flushBundle(bundle, sock) {
+  const key = `${bundle.groupJid}:${bundle.senderJid}`;
+  const combinedText = bundle.texts.join('\n').trim();
+
+  // If media was sent without any text, hold for 25s in case seller sends price separately
+  if (!combinedText) {
+    if (bundle.media.length > 0) {
+      console.info(`[Vision Buffer] ${bundle.senderJid} posted ${bundle.media.length} image(s) without text. Waiting 25s for price follow-up...`);
+      const timer = setTimeout(async () => {
+        recentUncaptionedMedia.delete(key);
+        console.info(`[Vision Scan] Scanning image from ${bundle.senderJid} for visible price or flyer text...`);
+        await processListing({
+          groupJid: bundle.groupJid,
+          senderJid: bundle.senderJid,
+          text: '',
+          media: bundle.media,
+          messageIds: bundle.messageIds,
+        }, sock);
+      }, 25_000);
+
+      recentUncaptionedMedia.set(key, {
+        media: bundle.media,
+        messageIds: bundle.messageIds,
+        timer,
+      });
+    }
+    return;
+  }
+
+  await processListing({
+    groupJid: bundle.groupJid,
+    senderJid: bundle.senderJid,
+    text: combinedText,
+    media: bundle.media,
+    messageIds: bundle.messageIds,
+  }, sock);
 }
 
 function queueListingItem({ groupJid, senderJid, messageId, details, text, sock }) {
   const key = `${groupJid}:${senderJid}`;
+  const cleanText = String(text || '').trim();
+  const msgHasPrice = hasPriceInText(cleanText);
+
   let bundle = pendingBundles.get(key);
+
+  // If an existing bundle ALREADY contains a price, AND this new message ALSO introduces a price:
+  // The seller is posting a separate product! Immediately flush the previous bundle and start fresh.
+  const bundleHasPrice = bundle && bundle.texts.some(t => hasPriceInText(t));
+  if (bundle && bundleHasPrice && msgHasPrice) {
+    clearTimeout(bundle.timer);
+    pendingBundles.delete(key);
+    flushBundle(bundle, sock);
+    bundle = null;
+  }
+
   if (!bundle) {
     bundle = {
       groupJid,
@@ -245,53 +338,21 @@ function queueListingItem({ groupJid, senderJid, messageId, details, text, sock 
     bundle.media.push(details);
   }
 
-  if (text && text.trim()) {
-    const clean = text.trim();
-    if (!bundle.texts.includes(clean)) {
-      bundle.texts.push(clean);
+  if (cleanText) {
+    if (!bundle.texts.includes(cleanText)) {
+      bundle.texts.push(cleanText);
     }
   }
 
   if (bundle.timer) clearTimeout(bundle.timer);
 
+  // For complete single-photo posts with price, debounce 2.5s; otherwise normal 4s
+  const debounceMs = (details && msgHasPrice) ? 2_500 : bundleWindowMs;
+
   bundle.timer = setTimeout(async () => {
     pendingBundles.delete(key);
-    const combinedText = bundle.texts.join('\n').trim();
-
-    // If media was sent without any text, hold for 30s in case seller sends price separately
-    if (!combinedText) {
-      if (bundle.media.length > 0) {
-        console.info(`[Vision Buffer] ${bundle.senderJid} posted ${bundle.media.length} image(s) without text. Waiting 30s for price follow-up...`);
-        const timer = setTimeout(async () => {
-          recentUncaptionedMedia.delete(key);
-          // Vision scan for flyer or on-image price sticker
-          console.info(`[Vision Scan] Scanning image from ${bundle.senderJid} for visible price or flyer text...`);
-          await processListing({
-            groupJid: bundle.groupJid,
-            senderJid: bundle.senderJid,
-            text: '',
-            media: bundle.media,
-            messageIds: bundle.messageIds,
-          }, sock);
-        }, 30_000);
-
-        recentUncaptionedMedia.set(key, {
-          media: bundle.media,
-          messageIds: bundle.messageIds,
-          timer,
-        });
-      }
-      return;
-    }
-
-    await processListing({
-      groupJid: bundle.groupJid,
-      senderJid: bundle.senderJid,
-      text: combinedText,
-      media: bundle.media,
-      messageIds: bundle.messageIds,
-    }, sock);
-  }, bundleWindowMs);
+    await flushBundle(bundle, sock);
+  }, debounceMs);
 }
 
 async function onMessage(sock, message) {

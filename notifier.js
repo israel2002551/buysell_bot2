@@ -9,10 +9,10 @@ function sellerJid(senderJid) {
 export async function sendSellerConfirmation(sock, { senderJid, listing, manageToken, publicSiteUrl }) {
   const target = sellerJid(senderJid);
   const siteUrl = String(publicSiteUrl || process.env.PUBLIC_SITE_URL || '').replace(/\/+$/, '');
-  const manageUrl = siteUrl
+  const manageUrl = siteUrl && manageToken && listing?.product_id
     ? `${siteUrl}/manage?product=${encodeURIComponent(listing.product_id)}&token=${encodeURIComponent(manageToken)}`
     : '';
-  const publicUrl = listing.public_url || (siteUrl ? `${siteUrl}/product?id=${encodeURIComponent(listing.product_id)}` : '');
+  const publicUrl = listing?.public_url || (siteUrl && listing?.product_id ? `${siteUrl}/product?id=${encodeURIComponent(listing.product_id)}` : '');
   const message = [
     '🛍️ *Your item was received by BUYSELL*',
     '',
@@ -28,11 +28,53 @@ export async function sendSellerConfirmation(sock, { senderJid, listing, manageT
 
   try {
     await sock.sendPresenceUpdate('composing', target);
-    await new Promise(resolve => setTimeout(resolve, 900));
+    await new Promise(resolve => setTimeout(resolve, 800));
     await sock.sendPresenceUpdate('paused', target);
     await sock.sendMessage(target, { text: message });
   } catch (error) {
     console.error('[Seller notification]', error?.message || error);
+  }
+}
+
+export async function sendSellerBatchConfirmation(sock, { senderJid, listings, publicSiteUrl }) {
+  if (!listings || !listings.length) return;
+  if (listings.length === 1) {
+    return sendSellerConfirmation(sock, {
+      senderJid,
+      listing: listings[0].listing,
+      manageToken: listings[0].manageToken,
+      publicSiteUrl,
+    });
+  }
+
+  const target = sellerJid(senderJid);
+  const siteUrl = String(publicSiteUrl || process.env.PUBLIC_SITE_URL || '').replace(/\/+$/, '');
+
+  const itemsLines = listings.map((entry, index) => {
+    const name = entry.listing?.product?.name || entry.finalTitle || `Item #${index + 1}`;
+    const priceVal = entry.listing?.product?.price || entry.item?.price;
+    const manageUrl = siteUrl && entry.manageToken && entry.listing?.product_id
+      ? `\n   ⚙️ Manage: ${siteUrl}/manage?product=${encodeURIComponent(entry.listing.product_id)}&token=${encodeURIComponent(entry.manageToken)}`
+      : '';
+    return `${index + 1}️⃣ *${name}* — ${money(priceVal)}${manageUrl}`;
+  });
+
+  const message = [
+    `🛍️ *${listings.length} items were received by BUYSELL*`,
+    '',
+    itemsLines.join('\n\n'),
+    '',
+    'Your listings are awaiting BUYSELL review before they appear publicly.',
+    'You can reply *SOLD* to this chat to close your latest active listing.',
+  ].join('\n');
+
+  try {
+    await sock.sendPresenceUpdate('composing', target);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await sock.sendPresenceUpdate('paused', target);
+    await sock.sendMessage(target, { text: message });
+  } catch (error) {
+    console.error('[Seller batch notification]', error?.message || error);
   }
 }
 
