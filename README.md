@@ -41,7 +41,7 @@ GROQ_API_KEY=gsk_your_groq_key
 GROQ_MODEL=qwen/qwen3.8-27b
 
 # Bot Settings
-WHATSAPP_PHONE_NUMBER=234...
+# Bot 2 now uses QR pairing. WHATSAPP_PHONE_NUMBER is optional and not used for linking.
 SESSION_DIR=/path/to/persistent/wa_vision_auth_session
 WHATSAPP_MONITOR_ALL_GROUPS=true
 WHATSAPP_MEDIA_INTAKE_CONCURRENCY=2
@@ -65,7 +65,7 @@ PUBLIC_SITE_URL=https://your-buysell-site.com
    - **Start Command:** `npm start`
    - **Plan:** `Free`
 2. Add the environment variables listed above.
-3. Check the Render logs on first run to copy your 8-digit **WhatsApp Pairing Code** and link the device on WhatsApp.
+3. Open your service's `/pair` page on first run and scan the displayed **WhatsApp QR code**.
 4. Add your Render service URL to **UptimeRobot** (5-minute interval) to keep it awake 24/7.
 
 ### Required Render session storage
@@ -82,9 +82,9 @@ After the disk is attached, deploy once and pair the device one final time. Do n
 
 ### Pairing reliably
 
-Open `/pair` on the Bot 2 service, then immediately use the displayed code in WhatsApp: **Settings → Linked Devices → Link a device → Link with phone number instead**. Codes expire after 60 seconds.
+Open `/pair` on the Bot 2 service. On the WhatsApp account Bot 2 should use, go to **Settings → Linked Devices → Link a device**, then scan the QR code shown on the page. Keep the page open because WhatsApp automatically refreshes QR codes.
 
-The pairing page now retries a failed initial code request and includes **Send pairing prompt / fresh code again**, which asks WhatsApp for another code without deleting the current pairing session. WhatsApp push notifications can be delayed or suppressed by the phone; the active code on `/pair` is the source of truth. Use **New Code** only if WhatsApp explicitly says it could not link, or if changing the target phone number.
+Bot 2 still prints the QR in Render logs as a fallback, but the `/pair` page is the easiest way to scan it. Use **Reset QR session** only after several failed scans.
 
 ## WhatsApp session safety
 

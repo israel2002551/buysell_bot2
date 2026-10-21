@@ -12,6 +12,7 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import sharp from 'sharp';
 import 'dotenv/config';
 import { parseListingWithVision, looksLikeSalePost, stripPriceFromText, hasPriceInText, transcribeVideoAudio } from './parser.js';
@@ -142,88 +143,11 @@ let keepAliveTimer = null;
 let collectorIsStarting = false;
 let warnedAboutSessionStorage = false;
 
-// Live pairing state for web dashboard /pair and session recovery
-let latestPairingCode = null;
-let pairingCodeGeneratedAt = null;
+// Live QR pairing state for web dashboard /pair.
+let latestPairingQrImage = null;
+let pairingQrGeneratedAt = null;
 let pairingTargetPhone = null;
 let latestPairingError = null;
-let activePairingCodeRaw = null;
-let pairingCodeRequestTimer = null;
-let pairingCodeRequestSocket = null;
-let pairingCodeRequestAttempts = 0;
-const PAIRING_CODE_REUSE_WINDOW_MS = 55_000;
-
-function clearPairingCodeRequestTimer() {
-  if (pairingCodeRequestTimer) {
-    clearTimeout(pairingCodeRequestTimer);
-    pairingCodeRequestTimer = null;
-  }
-}
-
-function schedulePairingCodeRequest(sock, phoneNumber, delayMs = 0, reason = 'initial request', codeToReuse = null) {
-  clearPairingCodeRequestTimer();
-  pairingCodeRequestTimer = setTimeout(() => {
-    pairingCodeRequestTimer = null;
-    void requestPairingCode(sock, phoneNumber, reason, codeToReuse);
-  }, delayMs);
-}
-
-function canReuseActivePairingCode(phoneNumber) {
-  const ageMs = pairingCodeGeneratedAt ? Date.now() - pairingCodeGeneratedAt : Number.POSITIVE_INFINITY;
-  return Boolean(
-    phoneNumber
-    && phoneNumber === pairingTargetPhone
-    && /^[A-Z0-9]{8}$/.test(activePairingCodeRaw || '')
-    && ageMs >= 0
-    && ageMs < PAIRING_CODE_REUSE_WINDOW_MS,
-  );
-}
-
-async function requestPairingCode(sock, phoneNumber, reason = 'manual request', codeToReuse = null) {
-  if (!phoneNumber || sock !== activeSocket || whatsappConnected || pairingCodeRequestSocket === sock) return false;
-
-  pairingCodeRequestSocket = sock;
-  try {
-    const code = await sock.requestPairingCode(phoneNumber, codeToReuse || undefined);
-    // A reset/reconnect can replace the socket while WhatsApp is processing the
-    // request. Never let that stale request replace the new session's code.
-    if (sock !== activeSocket || whatsappConnected) return false;
-    const rawCode = String(code || '').replace(/-/g, '').toUpperCase();
-    const formatted = rawCode.match(/.{1,4}/g)?.join('-') || code;
-    activePairingCodeRaw = rawCode;
-    latestPairingCode = formatted;
-    pairingCodeGeneratedAt = Date.now();
-    latestPairingError = null;
-    pairingTargetPhone = phoneNumber;
-    pairingCodeRequestAttempts = 0;
-
-    console.log('\n============================================================');
-    console.log(`[BOT 2 VISION] WHATSAPP PAIRING CODE FOR +${phoneNumber}: ${formatted}`);
-    console.log('============================================================');
-    console.log(`On your phone for Bot 2 (+${phoneNumber}):`);
-    console.log('1. Open WhatsApp -> Settings -> Linked Devices');
-    console.log('2. Ensure you have under 4 linked devices (remove old ones if needed)');
-    console.log('3. Tap "Link a device"');
-    console.log('4. Tap "Link with phone number instead" at the bottom');
-    console.log(`5. Enter code within 60s: ${formatted}\n`);
-    return true;
-  } catch (err) {
-    latestPairingError = err?.message || String(err);
-    console.error(`[Bot 2] Failed to request pairing code (${reason}):`, latestPairingError);
-
-    // Render and WhatsApp can take longer than the original fixed 3-second wait
-    // to open the pairing socket. Retry the request a few times on the same fresh
-    // session so the phone receives a pairing prompt without the user resetting it.
-    if (sock === activeSocket && !whatsappConnected && pairingCodeRequestAttempts < 3) {
-      const retryDelays = [5_000, 10_000, 20_000];
-      const retryDelay = retryDelays[pairingCodeRequestAttempts++];
-      schedulePairingCodeRequest(sock, phoneNumber, retryDelay, 'automatic retry', codeToReuse);
-    }
-    return false;
-  } finally {
-    if (pairingCodeRequestSocket === sock) pairingCodeRequestSocket = null;
-  }
-}
 
 // libsignal writes complete session objects (including private key material) to
 // the process console when it recovers a stale session. Baileys' pino logger
@@ -1067,7 +991,6 @@ async function startVisionCollector() {
 
   try {
     if (activeSocket) {
-      clearPairingCodeRequestTimer();
       safeCloseSocket(activeSocket);
       activeSocket = null;
     }
@@ -1101,32 +1024,17 @@ async function startVisionCollector() {
     let state = auth.state;
     let saveCreds = auth.saveCreds;
 
-    // If session is NOT registered, ensure clean crypto keys for pairing
+    // Clear only an incomplete legacy phone-code session. QR pairing does not
+    // depend on the configured phone number and gets a fresh QR automatically.
     if (!state.creds.registered && phoneNumber) {
-      let previousTarget = '';
-      try {
-        if (existsSync(pairingTargetFile)) {
-          previousTarget = readFileSync(pairingTargetFile, 'utf-8').trim();
-        }
-      } catch {}
-
-      // Preserve the active pairing key for a short reconnect. Resetting it while
-      // the user is typing the displayed code invalidates that code and results in
-      // WhatsApp's "Couldn't link device" error. Old/expired attempts still get a
-      // clean session because WhatsApp codes have a short lifetime.
       const hasOldPairingState = Boolean(state.creds.me || state.creds.pairingCode);
-      const phoneMismatch = Boolean(previousTarget && previousTarget !== phoneNumber);
-      const resumeActivePairing = !phoneMismatch && hasOldPairingState && canReuseActivePairingCode(phoneNumber);
-
-      if (phoneMismatch || (hasOldPairingState && !resumeActivePairing)) {
-        console.warn(`[Session] Resetting un-registered session files for +${phoneNumber} to guarantee clean pairing keys...`);
+      if (hasOldPairingState) {
+        console.warn('[Session] Removing an incomplete legacy phone-code session before QR pairing...');
         try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
         mkdirSync(sessionDir, { recursive: true });
         auth = await useMultiFileAuthState(sessionDir);
         state = auth.state;
         saveCreds = auth.saveCreds;
-      } else if (resumeActivePairing) {
-        console.info(`[Session] Reusing the active pairing code for +${phoneNumber} after a transient reconnect.`);
       }
       try { writeFileSync(pairingTargetFile, phoneNumber, 'utf-8'); } catch {}
     }
@@ -1150,8 +1058,6 @@ async function startVisionCollector() {
     });
     activeSocket = sock;
     let credsSavePromise = Promise.resolve();
-    let pairingCodeRequestedOnSocket = false;
-    const pairingCodeForReconnect = canReuseActivePairingCode(phoneNumber) ? activePairingCodeRaw : null;
     sock.ev.on('creds.update', () => {
       // The post-pairing restart can arrive immediately after the credential
       // update. Serialize disk writes so the next socket always sees the new keys.
@@ -1161,32 +1067,30 @@ async function startVisionCollector() {
     });
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-      // Baileys emits a QR reference even for phone-number pairing. Waiting for
-      // this event ensures the WebSocket is ready before registering the code.
-      // Requesting it from a fixed startup timer can produce a code that the
-      // phone displays but WhatsApp never accepts.
-      if (qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
-        pairingCodeRequestedOnSocket = true;
-        pairingCodeRequestAttempts = 0;
-        schedulePairingCodeRequest(
-          sock,
-          phoneNumber,
-          0,
-          pairingCodeForReconnect ? 'transient reconnect' : 'QR-ready pairing request',
-          pairingCodeForReconnect,
-        );
-      }
-      if (qr && !phoneNumber) {
+      if (qr && !state.creds.registered) {
+        try {
+          const qrImage = await QRCode.toDataURL(qr, {
+            errorCorrectionLevel: 'M',
+            margin: 2,
+            width: 360,
+            color: { dark: '#020617', light: '#ffffff' },
+          });
+          if (sock !== activeSocket || state.creds.registered) return;
+          latestPairingQrImage = qrImage;
+          pairingQrGeneratedAt = Date.now();
+          latestPairingError = null;
+        } catch (error) {
+          latestPairingError = `Could not render QR code: ${error?.message || error}`;
+          console.error('[Bot 2] Failed to render pairing QR code:', error?.message || error);
+        }
         console.log('[BOT 2 VISION] Scan this QR code to link:');
         qrcode.generate(qr, { small: true });
       }
       if (connection === 'open') {
         whatsappConnected = true;
         reconnectAttempts = 0;
-        clearPairingCodeRequestTimer();
-        latestPairingCode = null;
-        pairingCodeGeneratedAt = null;
-        activePairingCodeRaw = null;
+        latestPairingQrImage = null;
+        pairingQrGeneratedAt = null;
         console.log(`BUYSELL WhatsApp Vision Collector (Bot 2) is active and connected as +${sock?.user?.id?.split(':')[0] || phoneNumber}.`);
         sock.sendPresenceUpdate('available').catch(() => {});
         startKeepAlive(sock);
@@ -1195,7 +1099,8 @@ async function startVisionCollector() {
       if (connection === 'close') {
         await credsSavePromise;
         whatsappConnected = false;
-        clearPairingCodeRequestTimer();
+        latestPairingQrImage = null;
+        pairingQrGeneratedAt = null;
         stopKeepAlive();
         const code = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = code === DisconnectReason.loggedOut;
@@ -1302,17 +1207,6 @@ if (port) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
 
-    // Ask WhatsApp to send the phone-link prompt again without discarding the
-    // active pairing handshake. This is safer and faster than resetting keys.
-    if (pathname === '/request-pairing-code') {
-      if (!whatsappConnected && activeSocket && pairingTargetPhone) {
-        await requestPairingCode(activeSocket, pairingTargetPhone, 'manual dashboard request');
-      }
-      res.writeHead(302, { Location: '/pair' });
-      res.end();
-      return;
-    }
-
     // Reset session endpoint to force clean cryptographic keys without redeploying
     if (pathname === '/reset-session') {
       if (whatsappConnected) {
@@ -1330,17 +1224,14 @@ if (port) {
       }
       console.warn('[HTTP] Manual session reset requested. Wiping unlinked session files...');
       stopKeepAlive();
-      clearPairingCodeRequestTimer();
-      pairingCodeRequestAttempts = 0;
       if (activeSocket) {
         safeCloseSocket(activeSocket);
         activeSocket = null;
       }
       const sessionDir = process.env.SESSION_DIR || './wa_vision_auth_session';
       try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
-      latestPairingCode = null;
-      pairingCodeGeneratedAt = null;
-      activePairingCodeRaw = null;
+      latestPairingQrImage = null;
+      pairingQrGeneratedAt = null;
       latestPairingError = null;
       reconnectAttempts = 0;
       scheduleReconnect(true);
@@ -1350,12 +1241,12 @@ if (port) {
     }
 
     if (pathname === '/pair/status') {
-      const codeAgeSeconds = pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null;
+      const qrAgeSeconds = pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null;
       sendCompressedResponse(req, res, 200, {
         connected: whatsappConnected,
-        code: latestPairingCode,
-        code_age_seconds: codeAgeSeconds,
-        code_expired: codeAgeSeconds !== null && codeAgeSeconds > 60,
+        qr_available: Boolean(latestPairingQrImage),
+        qr_generated_at: pairingQrGeneratedAt,
+        qr_generated_seconds_ago: qrAgeSeconds,
         error: latestPairingError,
       });
       return;
@@ -1364,12 +1255,9 @@ if (port) {
     // Interactive web pairing dashboard
     if (pathname === '/pair' || (pathname === '/' && req.headers.accept?.includes('text/html'))) {
       const isConnected = whatsappConnected;
-      const targetPhone = pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256';
-      const code = latestPairingCode;
-      const rawCode = code ? code.replace(/-/g, '') : '';
-      const codeAge = pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null;
-      const codeExpired = codeAge !== null && codeAge > 60;
-      const remainingSec = codeAge ? Math.max(0, 60 - codeAge) : 60;
+      const linkedPhone = activeSocket?.user?.id?.split(':')[0] || 'your WhatsApp account';
+      const qrImage = latestPairingQrImage;
+      const qrAgeSeconds = pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null;
 
       const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1386,8 +1274,8 @@ if (port) {
     .status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; margin-bottom: 18px; }
     .status.online { background: #064e3b; color: #34d399; }
     .status.waiting { background: #78350f; color: #fbbf24; }
-    .code-box { background: #030712; border: 2px dashed #38bdf8; border-radius: 14px; padding: 20px; text-align: center; margin: 18px 0; }
-    .code { font-size: 34px; font-weight: 900; letter-spacing: 5px; color: #38bdf8; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .qr-box { background: #ffffff; border: 2px dashed #38bdf8; border-radius: 14px; padding: 12px; text-align: center; margin: 18px auto; width: min(100%, 384px); }
+    .qr-image { display: block; width: 100%; height: auto; image-rendering: pixelated; }
     .timer { font-size: 13px; color: #94a3b8; margin-top: 8px; }
     .btn { display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 8px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; transition: background 0.2s; }
     .btn:hover { background: #1d4ed8; }
@@ -1404,27 +1292,13 @@ if (port) {
   <div class="card">
     <h1>🤖 BUYSELL Bot 2 Collector</h1>
     ${isConnected ? `
-      <div class="status online">● Connected & Active (+${targetPhone})</div>
+      <div class="status online">● Connected & Active (${linkedPhone})</div>
       <p style="color: #cbd5e1; font-size: 14px; line-height: 1.6;">WhatsApp Vision Collector is actively monitoring WhatsApp seller groups and indexing products with AI.</p>
     ` : `
       <div class="status waiting">⏳ Awaiting WhatsApp Linking</div>
-      <p style="margin: 0; color: #94a3b8; font-size: 14px;">Target phone: <strong style="color: #f8fafc;">+${targetPhone}</strong></p>
+      <p style="margin: 0; color: #94a3b8; font-size: 14px;">Scan this QR code from the WhatsApp account you want Bot 2 to use.</p>
       
-      <div class="code-box">
-        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #94a3b8; margin-bottom: 6px;">Active 8-Character Pairing Code</div>
-        <div class="code">${code || 'Generating...'}</div>
-        <div class="timer">
-          ${code ? (codeExpired
-            ? '<strong style="color:#f87171;">⚠️ Code expired (>60s). Click "Generate Fresh Code" below.</strong>'
-            : `⏳ Valid for another <strong>${remainingSec}s</strong> (auto-refreshes every 5s)`)
-          : 'Connecting to WhatsApp pairing server...'}
-        </div>
-        ${code ? `
-          <button type="button" class="btn btn-secondary" style="margin-top: 12px; font-size: 12px; padding: 6px 14px;" onclick="navigator.clipboard.writeText('${rawCode}'); this.innerText='✓ Copied!'; setTimeout(() => this.innerText='📋 Copy Code', 2000);">
-            📋 Copy Code
-          </button>
-        ` : ''}
-      </div>
+      ${qrImage ? `<div class="qr-box"><img class="qr-image" src="${qrImage}" alt="WhatsApp pairing QR code"></div><p class="timer">QR refreshed ${qrAgeSeconds ?? 0}s ago. Keep this page open; it updates automatically.</p>` : '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>'}
 
       ${latestPairingError ? `
         <div class="warn" style="margin-bottom: 16px;">
@@ -1433,41 +1307,31 @@ if (port) {
       ` : ''}
 
       <div class="steps">
-        <strong style="color: #38bdf8;">On phone +${targetPhone}:</strong>
+        <strong style="color: #38bdf8;">On the phone with the WhatsApp account for Bot 2:</strong>
         <ol>
           <li>Open WhatsApp &rarr; <strong>Settings</strong> (or <strong>⋮</strong> menu) &rarr; <strong>Linked Devices</strong>.</li>
           <li><strong>Check limit:</strong> If you already have 4 linked devices, log out of one.</li>
           <li>Tap <strong>Link a device</strong>.</li>
-          <li>Tap <strong>"Link with phone number instead"</strong> at the bottom.</li>
-          <li>Type code: <strong style="color: #38bdf8; font-family: monospace; font-size: 15px;">${code || '...'}</strong></li>
+          <li>Use the phone camera to <strong>scan the QR code above</strong>.</li>
         </ol>
       </div>
 
-      <form action="/request-pairing-code" method="GET" style="margin-top: 14px;">
-        <button type="submit" class="btn btn-secondary" style="width: 100%;">Send pairing prompt / fresh code again</button>
-      </form>
-      <p style="margin: 8px 0 0; color: #94a3b8; font-size: 12px; line-height: 1.45;">If the phone notification is delayed or hidden, stay on the WhatsApp code-entry screen and use the code shown above. This button asks WhatsApp to send the linking prompt again without deleting the current session.</p>
-
       <form action="/reset-session" method="GET" style="margin-top: 14px;">
-        <label style="display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px;">Last resort only — changing the phone number or WhatsApp says it could not link?</label>
-        <div style="display: flex; gap: 8px;">
-          <input type="tel" name="phone" value="${targetPhone}" placeholder="09061484256" class="phone-input" />
-          <button type="submit" class="btn">🔄 New Code</button>
-        </div>
+        <button type="submit" class="btn btn-secondary" style="width: 100%;">Reset QR session</button>
       </form>
 
       <div class="warn">
-        💡 <strong>Tip:</strong> If WhatsApp displays <em>"Couldn't link device"</em>, tap <strong>New Code</strong> above to reset the crypto handshake keys, and make sure your phone has fewer than 4 linked devices.
+        💡 <strong>Tip:</strong> If the scanner rejects the QR, wait for the page to refresh the code. Use <strong>Reset QR session</strong> only after several failed scans.
       </div>
     `}
   </div>
   ${isConnected ? '' : `<script>
-    const pairingSnapshot = ${JSON.stringify({ code, error: latestPairingError })};
+    const pairingSnapshot = ${JSON.stringify({ qrGeneratedAt: pairingQrGeneratedAt, error: latestPairingError })};
     setInterval(() => {
       fetch('/pair/status', { cache: 'no-store' })
         .then(response => response.ok ? response.json() : null)
         .then(status => {
-          if (status && (status.connected || status.code !== pairingSnapshot.code || status.error !== pairingSnapshot.error)) {
+          if (status && (status.connected || status.qr_generated_at !== pairingSnapshot.qrGeneratedAt || status.error !== pairingSnapshot.error)) {
             window.location.reload();
           }
         })
@@ -1494,9 +1358,9 @@ if (port) {
       reconnect_attempts: reconnectAttempts,
       pairing: {
         connected: whatsappConnected,
-        target_phone: pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256',
-        code: latestPairingCode,
-        generated_seconds_ago: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
+        method: 'qr',
+        qr_available: Boolean(latestPairingQrImage),
+        qr_generated_seconds_ago: pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null,
         error: latestPairingError,
       },
       poll_interval_ms: currentPollIntervalMs,
