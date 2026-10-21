@@ -147,9 +147,11 @@ let latestPairingCode = null;
 let pairingCodeGeneratedAt = null;
 let pairingTargetPhone = null;
 let latestPairingError = null;
+let activePairingCodeRaw = null;
 let pairingCodeRequestTimer = null;
 let pairingCodeRequestSocket = null;
 let pairingCodeRequestAttempts = 0;
+const PAIRING_CODE_REUSE_WINDOW_MS = 55_000;
 
 function clearPairingCodeRequestTimer() {
   if (pairingCodeRequestTimer) {
@@ -158,24 +160,37 @@ function clearPairingCodeRequestTimer() {
   }
 }
 
-function schedulePairingCodeRequest(sock, phoneNumber, delayMs = 0, reason = 'initial request') {
+function schedulePairingCodeRequest(sock, phoneNumber, delayMs = 0, reason = 'initial request', codeToReuse = null) {
   clearPairingCodeRequestTimer();
   pairingCodeRequestTimer = setTimeout(() => {
     pairingCodeRequestTimer = null;
-    void requestPairingCode(sock, phoneNumber, reason);
+    void requestPairingCode(sock, phoneNumber, reason, codeToReuse);
   }, delayMs);
 }
 
-async function requestPairingCode(sock, phoneNumber, reason = 'manual request') {
+function canReuseActivePairingCode(phoneNumber) {
+  const ageMs = pairingCodeGeneratedAt ? Date.now() - pairingCodeGeneratedAt : Number.POSITIVE_INFINITY;
+  return Boolean(
+    phoneNumber
+    && phoneNumber === pairingTargetPhone
+    && /^[A-Z0-9]{8}$/.test(activePairingCodeRaw || '')
+    && ageMs >= 0
+    && ageMs < PAIRING_CODE_REUSE_WINDOW_MS,
+  );
+}
+
+async function requestPairingCode(sock, phoneNumber, reason = 'manual request', codeToReuse = null) {
   if (!phoneNumber || sock !== activeSocket || whatsappConnected || pairingCodeRequestSocket === sock) return false;
 
   pairingCodeRequestSocket = sock;
   try {
-    const code = await sock.requestPairingCode(phoneNumber);
+    const code = await sock.requestPairingCode(phoneNumber, codeToReuse || undefined);
     // A reset/reconnect can replace the socket while WhatsApp is processing the
     // request. Never let that stale request replace the new session's code.
     if (sock !== activeSocket || whatsappConnected) return false;
-    const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
+    const rawCode = String(code || '').replace(/-/g, '').toUpperCase();
+    const formatted = rawCode.match(/.{1,4}/g)?.join('-') || code;
+    activePairingCodeRaw = rawCode;
     latestPairingCode = formatted;
     pairingCodeGeneratedAt = Date.now();
     latestPairingError = null;
@@ -202,7 +217,7 @@ async function requestPairingCode(sock, phoneNumber, reason = 'manual request') 
     if (sock === activeSocket && !whatsappConnected && pairingCodeRequestAttempts < 3) {
       const retryDelays = [5_000, 10_000, 20_000];
       const retryDelay = retryDelays[pairingCodeRequestAttempts++];
-      schedulePairingCodeRequest(sock, phoneNumber, retryDelay, 'automatic retry');
+      schedulePairingCodeRequest(sock, phoneNumber, retryDelay, 'automatic retry', codeToReuse);
     }
     return false;
   } finally {
@@ -1095,19 +1110,23 @@ async function startVisionCollector() {
         }
       } catch {}
 
-      // If target phone changed, OR if creds.json already has an unlinked pairing attempt
-      // (which holds a stale pairingEphemeralKeyPair that WhatsApp rejects),
-      // wipe the unregistered session files so Baileys starts with brand-new pristine keypairs.
+      // Preserve the active pairing key for a short reconnect. Resetting it while
+      // the user is typing the displayed code invalidates that code and results in
+      // WhatsApp's "Couldn't link device" error. Old/expired attempts still get a
+      // clean session because WhatsApp codes have a short lifetime.
       const hasOldPairingState = Boolean(state.creds.me || state.creds.pairingCode);
       const phoneMismatch = Boolean(previousTarget && previousTarget !== phoneNumber);
+      const resumeActivePairing = !phoneMismatch && hasOldPairingState && canReuseActivePairingCode(phoneNumber);
 
-      if (phoneMismatch || hasOldPairingState) {
+      if (phoneMismatch || (hasOldPairingState && !resumeActivePairing)) {
         console.warn(`[Session] Resetting un-registered session files for +${phoneNumber} to guarantee clean pairing keys...`);
         try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
         mkdirSync(sessionDir, { recursive: true });
         auth = await useMultiFileAuthState(sessionDir);
         state = auth.state;
         saveCreds = auth.saveCreds;
+      } else if (resumeActivePairing) {
+        console.info(`[Session] Reusing the active pairing code for +${phoneNumber} after a transient reconnect.`);
       }
       try { writeFileSync(pairingTargetFile, phoneNumber, 'utf-8'); } catch {}
     }
@@ -1134,7 +1153,14 @@ async function startVisionCollector() {
 
     if (phoneNumber && !state.creds.registered) {
       pairingCodeRequestAttempts = 0;
-      schedulePairingCodeRequest(sock, phoneNumber, 3_000, 'initial request');
+      const reuseCurrentCode = canReuseActivePairingCode(phoneNumber) ? activePairingCodeRaw : null;
+      schedulePairingCodeRequest(
+        sock,
+        phoneNumber,
+        reuseCurrentCode ? 1_000 : 3_000,
+        reuseCurrentCode ? 'transient reconnect' : 'initial request',
+        reuseCurrentCode,
+      );
     }
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
@@ -1148,6 +1174,7 @@ async function startVisionCollector() {
         clearPairingCodeRequestTimer();
         latestPairingCode = null;
         pairingCodeGeneratedAt = null;
+        activePairingCodeRaw = null;
         console.log(`BUYSELL WhatsApp Vision Collector (Bot 2) is active and connected as +${sock?.user?.id?.split(':')[0] || phoneNumber}.`);
         sock.sendPresenceUpdate('available').catch(() => {});
         startKeepAlive(sock);
@@ -1300,6 +1327,7 @@ if (port) {
       try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
       latestPairingCode = null;
       pairingCodeGeneratedAt = null;
+      activePairingCodeRaw = null;
       latestPairingError = null;
       reconnectAttempts = 0;
       scheduleReconnect(true);
