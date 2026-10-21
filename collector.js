@@ -1149,21 +1149,33 @@ async function startVisionCollector() {
       },
     });
     activeSocket = sock;
-    sock.ev.on('creds.update', saveCreds);
+    let credsSavePromise = Promise.resolve();
+    let pairingCodeRequestedOnSocket = false;
+    const pairingCodeForReconnect = canReuseActivePairingCode(phoneNumber) ? activePairingCodeRaw : null;
+    sock.ev.on('creds.update', () => {
+      // The post-pairing restart can arrive immediately after the credential
+      // update. Serialize disk writes so the next socket always sees the new keys.
+      credsSavePromise = credsSavePromise
+        .then(() => saveCreds())
+        .catch(error => console.error('[Session] Could not persist WhatsApp credentials:', error?.message || error));
+    });
 
-    if (phoneNumber && !state.creds.registered) {
-      pairingCodeRequestAttempts = 0;
-      const reuseCurrentCode = canReuseActivePairingCode(phoneNumber) ? activePairingCodeRaw : null;
-      schedulePairingCodeRequest(
-        sock,
-        phoneNumber,
-        reuseCurrentCode ? 1_000 : 3_000,
-        reuseCurrentCode ? 'transient reconnect' : 'initial request',
-        reuseCurrentCode,
-      );
-    }
-
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      // Baileys emits a QR reference even for phone-number pairing. Waiting for
+      // this event ensures the WebSocket is ready before registering the code.
+      // Requesting it from a fixed startup timer can produce a code that the
+      // phone displays but WhatsApp never accepts.
+      if (qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
+        pairingCodeRequestedOnSocket = true;
+        pairingCodeRequestAttempts = 0;
+        schedulePairingCodeRequest(
+          sock,
+          phoneNumber,
+          0,
+          pairingCodeForReconnect ? 'transient reconnect' : 'QR-ready pairing request',
+          pairingCodeForReconnect,
+        );
+      }
       if (qr && !phoneNumber) {
         console.log('[BOT 2 VISION] Scan this QR code to link:');
         qrcode.generate(qr, { small: true });
@@ -1181,6 +1193,7 @@ async function startVisionCollector() {
         startListingQueuePolling();
       }
       if (connection === 'close') {
+        await credsSavePromise;
         whatsappConnected = false;
         clearPairingCodeRequestTimer();
         stopKeepAlive();
