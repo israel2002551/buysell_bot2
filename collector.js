@@ -53,7 +53,10 @@ const envTargetGroups = (process.env.WHATSAPP_TARGET_GROUPS || '')
   .map(g => g.trim())
   .filter(g => g.endsWith('@g.us'));
 
-const monitorAllGroups = String(process.env.WHATSAPP_MONITOR_ALL_GROUPS || 'true').toLowerCase() === 'true';
+// Bot 2 is intentionally an allow-list collector. It imports only groups in
+// the configured database list, the legacy list below, or WHATSAPP_TARGET_GROUPS.
+// Do not allow an environment value to broaden this into every joined group.
+const monitorAllGroups = false;
 const mediaIntakeConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_MEDIA_INTAKE_CONCURRENCY || 2), 4));
 const stagingConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_STAGING_CONCURRENCY || 2), 4));
 const listingWorkerConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_LISTING_WORKER_CONCURRENCY || 1), 3));
@@ -543,7 +546,6 @@ async function processListing(bundle, sock) {
       const listing = await api.ingest({
         source_message_id: itemSourceId,
         group_jid: bundle.groupJid,
-        monitor_all_groups: Boolean(bundle.monitorAllGroups),
         sender_jid: bundle.senderJid,
         sender_phone: parsed.seller_phone || rawPhone(bundle.senderJid),
         manage_token: manageToken,
@@ -663,7 +665,6 @@ function queueBundleForStaging(bundle) {
       sender_phone: rawPhone(bundle.senderJid),
       message_ids: [...new Set(bundle.messageIds || [])],
       payload: {
-        monitor_all_groups: monitorAllGroups,
         text: bundle.text || '',
         audio_transcript: audioTranscript,
         media: uploadedMedia,
@@ -698,7 +699,6 @@ async function processClaimedListingJob(job) {
     sourceKey: job.dedupe_key,
     text: String(payload.text || ''),
     audioTranscript: String(payload.audio_transcript || ''),
-    monitorAllGroups: payload.monitor_all_groups === true,
     media,
   };
 
