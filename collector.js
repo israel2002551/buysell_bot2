@@ -1047,6 +1047,10 @@ async function startVisionCollector() {
       syncFullHistory: false,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
+      // WhatsApp refreshes follow-up QR codes every 20 seconds by default.
+      // Keep each one available for a full minute so there is enough time to
+      // open Linked Devices and scan it without the code changing underneath.
+      qrTimeout: 60_000,
       keepAliveIntervalMs: 25_000,
       retryRequestDelayMs: 5_000,
       msgRetryCounterCache: messageRetryCounterCache,
@@ -1280,7 +1284,6 @@ if (port) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BUYSELL Bot 2 - WhatsApp Pairing</title>
-  <meta http-equiv="refresh" content="${isConnected ? '30' : '15'}">
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; }
@@ -1313,7 +1316,8 @@ if (port) {
       <div class="status waiting">⏳ Awaiting WhatsApp Linking</div>
       <p style="margin: 0; color: #94a3b8; font-size: 14px;">Scan this QR code from the WhatsApp account you want Bot 2 to use.</p>
       
-      ${qrAvailable ? `<div class="qr-box"><img class="qr-image" src="/pair/qr.svg?issued=${pairingQrGeneratedAt}" alt="WhatsApp pairing QR code"></div><p class="timer">QR refreshed ${qrAgeSeconds ?? 0}s ago. Keep this page open; it updates automatically.</p>` : '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>'}
+      <div id="pairing-qr-container">${qrAvailable ? `<div class="qr-box"><img id="pairing-qr-image" class="qr-image" src="/pair/qr.svg?issued=${pairingQrGeneratedAt}" alt="WhatsApp pairing QR code"></div>` : '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>'}</div>
+      <p id="pairing-qr-status" class="timer">${qrAvailable ? `This QR is ${qrAgeSeconds ?? 0}s old and remains valid for up to 60 seconds. Scan it now.` : 'Generating a secure QR code...'}</p>
 
       ${latestPairingError ? `
         <div class="warn" style="margin-bottom: 16px;">
@@ -1341,17 +1345,43 @@ if (port) {
     `}
   </div>
   ${isConnected ? '' : `<script>
-    const pairingSnapshot = ${JSON.stringify({ qrGeneratedAt: pairingQrGeneratedAt, error: latestPairingError })};
+    let currentQrIssuedAt = ${JSON.stringify(pairingQrGeneratedAt)};
+    const qrLifetimeSeconds = 60;
+    const qrContainer = document.getElementById('pairing-qr-container');
+    const qrStatus = document.getElementById('pairing-qr-status');
+
+    function updateQrDisplay(status) {
+      if (status.connected) {
+        window.location.reload();
+        return;
+      }
+
+      const issuedAt = status.qr_generated_at;
+      if (!status.qr_available || !issuedAt) {
+        qrContainer.innerHTML = '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>';
+        qrStatus.textContent = 'Generating a secure QR code...';
+        currentQrIssuedAt = null;
+        return;
+      }
+
+      if (issuedAt !== currentQrIssuedAt) {
+        qrContainer.innerHTML = '<div class="qr-box"><img id="pairing-qr-image" class="qr-image" src="/pair/qr.svg?issued=' + encodeURIComponent(issuedAt) + '" alt="WhatsApp pairing QR code"></div>';
+        currentQrIssuedAt = issuedAt;
+      }
+
+      const age = Number.isFinite(status.qr_generated_seconds_ago) ? status.qr_generated_seconds_ago : 0;
+      const remaining = Math.max(0, qrLifetimeSeconds - age);
+      qrStatus.textContent = 'This QR is ' + age + 's old. About ' + remaining + 's remain before a new QR is issued.';
+    }
+
     setInterval(() => {
       fetch('/pair/status', { cache: 'no-store' })
         .then(response => response.ok ? response.json() : null)
         .then(status => {
-          if (status && (status.connected || status.qr_generated_at !== pairingSnapshot.qrGeneratedAt || status.error !== pairingSnapshot.error)) {
-            window.location.reload();
-          }
+          if (status) updateQrDisplay(status);
         })
         .catch(() => {});
-    }, 2500);
+    }, 1000);
   </script>`}
 </body>
 </html>`;
