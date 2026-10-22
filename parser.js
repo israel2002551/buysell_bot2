@@ -23,6 +23,18 @@ const SCALE = '(?:k|m|thousand|million)';
 const MAX_VISION_IMAGES_PER_REQUEST = 3;
 const MAX_INLINE_IMAGE_BYTES = 1_500_000;
 
+// Groq's on-demand tier limits qwen output to 1,000 tokens per minute. Keep
+// each structured listing response comfortably below that ceiling so one post
+// cannot prevent the fallback parser from running.
+function outputTokenLimit(envName, fallback) {
+  const requested = Number(process.env[envName]);
+  const value = Number.isFinite(requested) ? requested : fallback;
+  return Math.max(160, Math.min(value, 700));
+}
+
+const GROQ_VISION_MAX_TOKENS = outputTokenLimit('GROQ_VISION_MAX_TOKENS', 500);
+const GROQ_TEXT_MAX_TOKENS = outputTokenLimit('GROQ_TEXT_MAX_TOKENS', 420);
+
 function normalisePriceText(value) {
   return String(value || '')
     .normalize('NFKC')
@@ -191,17 +203,17 @@ Return exactly one JSON object with these keys:
 - seller_phone: Nigerian seller phone digits only or null
 - location: city, area, campus, or town or null
 - items: array of product objects, where each object has:
-  * title: concise, attractive product title (maximum 80 characters, no price)
-  * description: clear, appealing product description (1-3 sentences, no price or currency figures)
+   * title: concise, attractive product title (maximum 60 characters, no price)
+   * description: one short sentence (maximum 160 characters, no price or currency figures)
   * price: whole Nigerian naira amount as a number, or null
   * price_raw: exact written price or null
   * category: one of "Phones & Tablets", "Computers & Laptops", "Electronics", "Vehicles", "Fashion", "Home & Furniture", "Beauty & Health", "Services", "Other"
   * condition: one of "brand_new", "foreign_used", "local_used", "refurbished", "unknown"
   * brand: manufacturer/brand or null
-  * specs: short factual specification summary or null
+   * specs: short factual summary (maximum 80 characters) or null
   * image_index: 0-based index of the matching visual input, or 0 if all visuals belong to it
 
-Output only JSON.
+Keep the response compact. Return at most 3 distinct items; when a post contains more, prioritize the three with the clearest title and price. Output only JSON.
 `;
 
 const VISION_MODELS = [...new Set([
@@ -331,7 +343,7 @@ async function parseVisionChunk(message, visualChunk) {
         ],
         response_format: { type: 'json_object' },
         temperature: 0.1,
-        max_tokens: 1_500,
+        max_tokens: GROQ_VISION_MAX_TOKENS,
       });
       const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
       const normalized = normalizeParsedResult(parsed, { mediaIndexMap });
@@ -355,7 +367,7 @@ async function parseTextOnly(message) {
         ],
         response_format: { type: 'json_object' },
         temperature: 0.1,
-        max_tokens: 1_500,
+        max_tokens: GROQ_TEXT_MAX_TOKENS,
       });
       const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
       const normalized = normalizeParsedResult(parsed);
