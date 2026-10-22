@@ -543,6 +543,7 @@ async function processListing(bundle, sock) {
       const listing = await api.ingest({
         source_message_id: itemSourceId,
         group_jid: bundle.groupJid,
+        monitor_all_groups: Boolean(bundle.monitorAllGroups),
         sender_jid: bundle.senderJid,
         sender_phone: parsed.seller_phone || rawPhone(bundle.senderJid),
         manage_token: manageToken,
@@ -662,6 +663,7 @@ function queueBundleForStaging(bundle) {
       sender_phone: rawPhone(bundle.senderJid),
       message_ids: [...new Set(bundle.messageIds || [])],
       payload: {
+        monitor_all_groups: monitorAllGroups,
         text: bundle.text || '',
         audio_transcript: audioTranscript,
         media: uploadedMedia,
@@ -696,6 +698,7 @@ async function processClaimedListingJob(job) {
     sourceKey: job.dedupe_key,
     text: String(payload.text || ''),
     audioTranscript: String(payload.audio_transcript || ''),
+    monitorAllGroups: payload.monitor_all_groups === true,
     media,
   };
 
