@@ -150,6 +150,7 @@ let sessionRecoveryRequired = false;
 // encryption state. Only regard it as healthy after it survives for a minute.
 const STABLE_CONNECTION_MS = 60_000;
 const MAX_UNSTABLE_STREAM_FAILURES = 3;
+const BAILEYS_ACK_PATCH_MARKER = './node_modules/@whiskeysockets/baileys/.buysell-message-ack-patched';
 
 function clearConnectionStabilityTimer() {
   if (connectionStabilityTimer) {
@@ -1080,6 +1081,11 @@ function onMessage(sock, message) {
 }
 
 async function startVisionCollector() {
+  if (!existsSync(BAILEYS_ACK_PATCH_MARKER)) {
+    sessionRecoveryRequired = true;
+    latestPairingError = 'The deployed image is missing the required WhatsApp acknowledgement patch. Rebuild Bot 2 from the current release.';
+    throw new Error('Required Baileys message-acknowledgement patch is absent. Rebuild the service from the current Docker image; do not run an unpatched collector.');
+  }
   if (sessionRecoveryRequired) {
     console.warn('[Bot 2] WhatsApp session repair is required before another connection can start.');
     return;
@@ -1157,7 +1163,10 @@ async function startVisionCollector() {
           keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
         },
       browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: true,
+      // The collector only receives messages. Staying unavailable avoids the
+      // Baileys 6 status-ack path that can also produce a 50-minute stream ACK
+      // disconnect, while native WebSocket keep-alives remain enabled below.
+      markOnlineOnConnect: false,
       syncFullHistory: false,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
