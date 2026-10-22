@@ -140,6 +140,35 @@ let reconnectAttempts = 0;
 let keepAliveTimer = null;
 let collectorIsStarting = false;
 let warnedAboutSessionStorage = false;
+let connectionOpenedAt = 0;
+let connectionStabilityTimer = null;
+let consecutiveUnstableStreamFailures = 0;
+let sessionRecoveryRequired = false;
+
+// A socket can report "open" immediately before WhatsApp rejects its stale
+// encryption state. Only regard it as healthy after it survives for a minute.
+const STABLE_CONNECTION_MS = 60_000;
+const MAX_UNSTABLE_STREAM_FAILURES = 3;
+
+function clearConnectionStabilityTimer() {
+  if (connectionStabilityTimer) {
+    clearTimeout(connectionStabilityTimer);
+    connectionStabilityTimer = null;
+  }
+}
+
+function beginConnectionStabilityCheck(sock) {
+  clearConnectionStabilityTimer();
+  connectionStabilityTimer = setTimeout(() => {
+    if (activeSocket === sock && whatsappConnected) {
+      reconnectAttempts = 0;
+      consecutiveUnstableStreamFailures = 0;
+      sessionRecoveryRequired = false;
+      latestPairingError = null;
+      console.info('[Bot 2] WhatsApp connection remained stable; reconnect state cleared.');
+    }
+  }, STABLE_CONNECTION_MS);
+}
 
 // Live phone-number pairing state for web dashboard /pair and session recovery.
 let latestPairingCode = null;
@@ -278,6 +307,10 @@ function startKeepAlive(sock) {
 }
 
 function scheduleReconnect(immediate = false) {
+  if (sessionRecoveryRequired) {
+    console.warn('[Bot 2] Automatic reconnect paused: repair the WhatsApp session from /pair.');
+    return;
+  }
   if (reconnectTimer) return;
 
   // Delays with exponential backoff: 1s (immediate/515 restart), 3s, 5s, 10s, 20s, 30s, up to 60s
@@ -1046,6 +1079,10 @@ function onMessage(sock, message) {
 }
 
 async function startVisionCollector() {
+  if (sessionRecoveryRequired) {
+    console.warn('[Bot 2] WhatsApp session repair is required before another connection can start.');
+    return;
+  }
   if (collectorIsStarting) return;
   if (activeSocket && whatsappConnected) return;
   collectorIsStarting = true;
@@ -1139,6 +1176,12 @@ async function startVisionCollector() {
     });
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      // A delayed event from a socket we have already replaced must not change
+      // the status or restart the collector for the current socket.
+      if (activeSocket !== sock) {
+        if (connection === 'close') safeCloseSocket(sock);
+        return;
+      }
       // Baileys emits a QR reference even for phone-number pairing. It confirms
       // the socket is ready; only then request the code WhatsApp can accept.
       if (qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
@@ -1154,7 +1197,8 @@ async function startVisionCollector() {
       }
       if (connection === 'open') {
         whatsappConnected = true;
-        reconnectAttempts = 0;
+        connectionOpenedAt = Date.now();
+        beginConnectionStabilityCheck(sock);
         clearPairingCodeRequestTimer();
         latestPairingCode = null;
         pairingCodeGeneratedAt = null;
@@ -1166,14 +1210,25 @@ async function startVisionCollector() {
       }
       if (connection === 'close') {
         await credsSavePromise;
+        clearConnectionStabilityTimer();
+        const connectionLifetimeMs = connectionOpenedAt ? Date.now() - connectionOpenedAt : 0;
+        connectionOpenedAt = 0;
         whatsappConnected = false;
         clearPairingCodeRequestTimer();
         stopKeepAlive();
         const code = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = code === DisconnectReason.loggedOut;
         const isRestartRequired = code === DisconnectReason.restartRequired;
+        const closeReason = lastDisconnect?.error?.message || 'unknown';
+        const isAckStreamError = code === 500 && /stream\s+errored.*ack/i.test(closeReason);
+        const wasShortLived = connectionLifetimeMs > 0 && connectionLifetimeMs < STABLE_CONNECTION_MS;
+        const isUnstableStreamFailure = isAckStreamError || wasShortLived;
 
-        console.warn(`[Bot 2] WhatsApp connection closed (code: ${code ?? 'unknown'}, reason: ${lastDisconnect?.error?.message || 'unknown'}).`);
+        consecutiveUnstableStreamFailures = isUnstableStreamFailure
+          ? consecutiveUnstableStreamFailures + 1
+          : 0;
+
+        console.warn(`[Bot 2] WhatsApp connection closed (code: ${code ?? 'unknown'}, reason: ${closeReason}, lifetime: ${connectionLifetimeMs || 0}ms).`);
 
         if (activeSocket === sock) {
           activeSocket = null;
@@ -1183,8 +1238,14 @@ async function startVisionCollector() {
         if (isLoggedOut) {
           console.warn('[Session] Session unlinked. Resetting session directory and requesting a fresh pairing.');
           try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+          sessionRecoveryRequired = false;
+          consecutiveUnstableStreamFailures = 0;
           reconnectAttempts = 0;
           scheduleReconnect(false);
+        } else if (consecutiveUnstableStreamFailures >= MAX_UNSTABLE_STREAM_FAILURES) {
+          sessionRecoveryRequired = true;
+          latestPairingError = 'WhatsApp rejected this saved session repeatedly. Select Repair WhatsApp session below, then link using one new phone-number code.';
+          console.error(`[Bot 2] Pausing reconnect after ${consecutiveUnstableStreamFailures} unstable stream failures. Session repair is required.`);
         } else if (isRestartRequired) {
           console.info('[Bot 2] Restart required by WhatsApp. Reconnecting immediately...');
           scheduleReconnect(true);
@@ -1276,9 +1337,10 @@ if (port) {
 
     // Reset session endpoint to force clean cryptographic keys without redeploying
     if (pathname === '/reset-session') {
-      if (whatsappConnected) {
+      const forceRepair = url.searchParams.get('force') === '1';
+      if (whatsappConnected && !forceRepair) {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h3>Bot 2 is already connected to WhatsApp!</h3><p>Unlink from your phone if you wish to re-pair.</p><p><a href="/pair">Go back</a></p>');
+        res.end('<h3>Bot 2 is already connected to WhatsApp!</h3><p>If it is not receiving messages, use the Repair WhatsApp session button on the pairing page.</p><p><a href="/pair">Go back</a></p>');
         return;
       }
       const requestedPhone = url.searchParams.get('phone');
@@ -1289,8 +1351,10 @@ if (port) {
           console.info(`[HTTP] Target phone updated to +${pairingTargetPhone}`);
         }
       }
-      console.warn('[HTTP] Manual session reset requested. Wiping unlinked session files...');
+      console.warn(`[HTTP] ${forceRepair ? 'Session repair' : 'Manual session reset'} requested. Wiping saved WhatsApp session files...`);
       stopKeepAlive();
+      clearConnectionStabilityTimer();
+      connectionOpenedAt = 0;
       if (activeSocket) {
         safeCloseSocket(activeSocket);
         activeSocket = null;
@@ -1304,6 +1368,8 @@ if (port) {
       activePairingCodeRaw = null;
       latestPairingError = null;
       reconnectAttempts = 0;
+      consecutiveUnstableStreamFailures = 0;
+      sessionRecoveryRequired = false;
       scheduleReconnect(true);
       res.writeHead(302, { Location: '/pair' });
       res.end();
@@ -1329,6 +1395,7 @@ if (port) {
         code_age_seconds: codeAgeSeconds,
         code_expired: codeAgeSeconds !== null && codeAgeSeconds > 60,
         error: latestPairingError,
+        recovery_required: sessionRecoveryRequired,
       });
       return;
     }
@@ -1407,8 +1474,8 @@ if (port) {
       <form action="/request-pairing-code" method="GET" style="margin-top: 14px;">
         <button type="submit" class="btn btn-secondary" style="width: 100%;">Generate fresh code</button>
       </form>
-      <form action="/reset-session" method="GET" style="margin-top: 14px;">
-        <button type="submit" class="btn btn-secondary" style="width: 100%;">Reset pairing session</button>
+      <form action="/reset-session?force=1" method="GET" style="margin-top: 14px;">
+        <button type="submit" class="btn btn-secondary" style="width: 100%;">Repair WhatsApp session</button>
       </form>
 
       <div id="pairing-tip" class="warn">
@@ -1434,7 +1501,12 @@ if (port) {
       }
       if (!status.code) {
         codeElement.textContent = 'Generating...';
-        codeStatus.textContent = 'Connecting to WhatsApp pairing server...';
+        codeStatus.textContent = status.recovery_required
+          ? 'Session repair required. Select Repair WhatsApp session below.'
+          : 'Connecting to WhatsApp pairing server...';
+        if (status.recovery_required && pairingTip) {
+          pairingTip.textContent = 'WhatsApp rejected the saved session repeatedly. Select Repair WhatsApp session once, then enter the newly generated phone-number code.';
+        }
         return;
       }
       const age = Number.isFinite(status.code_age_seconds) ? status.code_age_seconds : 0;
@@ -1471,6 +1543,7 @@ if (port) {
       all_groups_monitored: monitorAllGroups,
       whatsapp_connected: whatsappConnected,
       reconnect_attempts: reconnectAttempts,
+      session_recovery_required: sessionRecoveryRequired,
         pairing: {
           connected: whatsappConnected,
           method: 'phone_number',
@@ -1478,6 +1551,7 @@ if (port) {
           code: latestPairingCode,
           generated_seconds_ago: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
           error: latestPairingError,
+          recovery_required: sessionRecoveryRequired,
         },
       poll_interval_ms: currentPollIntervalMs,
       max_media_bytes: MAX_MEDIA_BYTES,
