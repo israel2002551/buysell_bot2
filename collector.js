@@ -1073,7 +1073,7 @@ async function startVisionCollector() {
             type: 'svg',
             errorCorrectionLevel: 'M',
             margin: 4,
-            width: 512,
+            width: 360,
             color: { dark: '#020617', light: '#ffffff' },
           });
           if (sock !== activeSocket || state.creds.registered) return;
@@ -1289,8 +1289,8 @@ if (port) {
     .status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; margin-bottom: 18px; }
     .status.online { background: #064e3b; color: #34d399; }
     .status.waiting { background: #78350f; color: #fbbf24; }
-    .qr-box { background: #ffffff; border: 2px dashed #38bdf8; border-radius: 14px; padding: 20px; text-align: center; margin: 18px auto; width: min(100%, 540px); }
-    .qr-image { display: block; width: 100%; max-width: 512px; height: auto; margin: 0 auto; image-rendering: pixelated; }
+    .qr-box { background: #ffffff; border: 2px dashed #38bdf8; border-radius: 14px; padding: 12px; text-align: center; margin: 18px auto; width: min(100%, 384px); }
+    .qr-image { display: block; width: 100%; max-width: 360px; height: auto; margin: 0 auto; image-rendering: pixelated; }
     .timer { font-size: 13px; color: #94a3b8; margin-top: 8px; }
     .btn { display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 8px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; transition: background 0.2s; }
     .btn:hover { background: #1d4ed8; }
