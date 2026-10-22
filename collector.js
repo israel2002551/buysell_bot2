@@ -144,7 +144,7 @@ let collectorIsStarting = false;
 let warnedAboutSessionStorage = false;
 
 // Live QR pairing state for web dashboard /pair.
-let latestPairingQrImage = null;
+let latestPairingQrSvg = null;
 let pairingQrGeneratedAt = null;
 let pairingTargetPhone = null;
 let latestPairingError = null;
@@ -1069,14 +1069,15 @@ async function startVisionCollector() {
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (qr && !state.creds.registered) {
         try {
-          const qrImage = await QRCode.toDataURL(qr, {
+          const qrSvg = await QRCode.toString(qr, {
+            type: 'svg',
             errorCorrectionLevel: 'M',
-            margin: 2,
-            width: 360,
+            margin: 4,
+            width: 512,
             color: { dark: '#020617', light: '#ffffff' },
           });
           if (sock !== activeSocket || state.creds.registered) return;
-          latestPairingQrImage = qrImage;
+          latestPairingQrSvg = qrSvg;
           pairingQrGeneratedAt = Date.now();
           latestPairingError = null;
         } catch (error) {
@@ -1089,7 +1090,7 @@ async function startVisionCollector() {
       if (connection === 'open') {
         whatsappConnected = true;
         reconnectAttempts = 0;
-        latestPairingQrImage = null;
+        latestPairingQrSvg = null;
         pairingQrGeneratedAt = null;
         console.log(`BUYSELL WhatsApp Vision Collector (Bot 2) is active and connected as +${sock?.user?.id?.split(':')[0] || phoneNumber}.`);
         sock.sendPresenceUpdate('available').catch(() => {});
@@ -1099,7 +1100,7 @@ async function startVisionCollector() {
       if (connection === 'close') {
         await credsSavePromise;
         whatsappConnected = false;
-        latestPairingQrImage = null;
+        latestPairingQrSvg = null;
         pairingQrGeneratedAt = null;
         stopKeepAlive();
         const code = lastDisconnect?.error?.output?.statusCode;
@@ -1230,7 +1231,7 @@ if (port) {
       }
       const sessionDir = process.env.SESSION_DIR || './wa_vision_auth_session';
       try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
-      latestPairingQrImage = null;
+      latestPairingQrSvg = null;
       pairingQrGeneratedAt = null;
       latestPairingError = null;
       reconnectAttempts = 0;
@@ -1240,11 +1241,25 @@ if (port) {
       return;
     }
 
+    if (pathname === '/pair/qr.svg') {
+      if (!latestPairingQrSvg) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end('QR code is not ready yet.');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'image/svg+xml; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, max-age=0, must-revalidate',
+      });
+      res.end(latestPairingQrSvg);
+      return;
+    }
+
     if (pathname === '/pair/status') {
       const qrAgeSeconds = pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null;
       sendCompressedResponse(req, res, 200, {
         connected: whatsappConnected,
-        qr_available: Boolean(latestPairingQrImage),
+        qr_available: Boolean(latestPairingQrSvg),
         qr_generated_at: pairingQrGeneratedAt,
         qr_generated_seconds_ago: qrAgeSeconds,
         error: latestPairingError,
@@ -1256,7 +1271,7 @@ if (port) {
     if (pathname === '/pair' || (pathname === '/' && req.headers.accept?.includes('text/html'))) {
       const isConnected = whatsappConnected;
       const linkedPhone = activeSocket?.user?.id?.split(':')[0] || 'your WhatsApp account';
-      const qrImage = latestPairingQrImage;
+      const qrAvailable = Boolean(latestPairingQrSvg);
       const qrAgeSeconds = pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null;
 
       const html = `<!DOCTYPE html>
@@ -1274,8 +1289,8 @@ if (port) {
     .status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; margin-bottom: 18px; }
     .status.online { background: #064e3b; color: #34d399; }
     .status.waiting { background: #78350f; color: #fbbf24; }
-    .qr-box { background: #ffffff; border: 2px dashed #38bdf8; border-radius: 14px; padding: 12px; text-align: center; margin: 18px auto; width: min(100%, 384px); }
-    .qr-image { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+    .qr-box { background: #ffffff; border: 2px dashed #38bdf8; border-radius: 14px; padding: 20px; text-align: center; margin: 18px auto; width: min(100%, 540px); }
+    .qr-image { display: block; width: 100%; max-width: 512px; height: auto; margin: 0 auto; image-rendering: pixelated; }
     .timer { font-size: 13px; color: #94a3b8; margin-top: 8px; }
     .btn { display: inline-flex; align-items: center; justify-content: center; background: #2563eb; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 8px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; transition: background 0.2s; }
     .btn:hover { background: #1d4ed8; }
@@ -1298,7 +1313,7 @@ if (port) {
       <div class="status waiting">⏳ Awaiting WhatsApp Linking</div>
       <p style="margin: 0; color: #94a3b8; font-size: 14px;">Scan this QR code from the WhatsApp account you want Bot 2 to use.</p>
       
-      ${qrImage ? `<div class="qr-box"><img class="qr-image" src="${qrImage}" alt="WhatsApp pairing QR code"></div><p class="timer">QR refreshed ${qrAgeSeconds ?? 0}s ago. Keep this page open; it updates automatically.</p>` : '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>'}
+      ${qrAvailable ? `<div class="qr-box"><img class="qr-image" src="/pair/qr.svg?issued=${pairingQrGeneratedAt}" alt="WhatsApp pairing QR code"></div><p class="timer">QR refreshed ${qrAgeSeconds ?? 0}s ago. Keep this page open; it updates automatically.</p>` : '<div class="qr-box" style="background:#030712;color:#94a3b8;padding:32px 14px;">Generating a secure QR code...</div>'}
 
       ${latestPairingError ? `
         <div class="warn" style="margin-bottom: 16px;">
@@ -1359,7 +1374,7 @@ if (port) {
       pairing: {
         connected: whatsappConnected,
         method: 'qr',
-        qr_available: Boolean(latestPairingQrImage),
+        qr_available: Boolean(latestPairingQrSvg),
         qr_generated_seconds_ago: pairingQrGeneratedAt ? Math.round((Date.now() - pairingQrGeneratedAt) / 1000) : null,
         error: latestPairingError,
       },
