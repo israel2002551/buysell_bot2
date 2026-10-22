@@ -3,6 +3,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   extractMessageContent,
+  makeCacheableSignalKeyStore,
   normalizeMessageContent,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -1148,7 +1149,13 @@ async function startVisionCollector() {
 
     const sock = makeWASocket({
       logger: pino({ level: 'silent' }),
-      auth: state,
+        // Cache key reads while keeping the underlying store authoritative. This
+        // avoids a file read for every encrypted message and reduces the chance
+        // of auth-key I/O falling behind under busy group traffic.
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: true,
       syncFullHistory: false,
@@ -1204,8 +1211,6 @@ async function startVisionCollector() {
         pairingCodeGeneratedAt = null;
         activePairingCodeRaw = null;
         console.log(`BUYSELL WhatsApp Vision Collector (Bot 2) is active and connected as +${sock?.user?.id?.split(':')[0] || phoneNumber}.`);
-        sock.sendPresenceUpdate('available').catch(() => {});
-        startKeepAlive(sock);
         startListingQueuePolling();
       }
       if (connection === 'close') {
