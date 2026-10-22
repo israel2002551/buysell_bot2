@@ -3,6 +3,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   extractMessageContent,
+  fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
   useMultiFileAuthState,
@@ -1156,6 +1157,12 @@ async function startVisionCollector() {
       try { writeFileSync(pairingTargetFile, phoneNumber, 'utf-8'); } catch {}
     }
 
+    // Pairing codes are validated against WhatsApp's current companion protocol.
+    // Fetch the current version before creating the socket instead of relying on
+    // the version bundled with this older Baileys release.
+    const versionInfo = await fetchLatestBaileysVersion({ timeout: 12_000 });
+    console.info(`[WhatsApp Protocol] Using version ${versionInfo.version.join('.')} (${versionInfo.isLatest ? 'current' : 'bundled fallback'}).`);
+
     const sock = makeWASocket({
       logger: pino({ level: 'silent' }),
         // Cache key reads while keeping the underlying store authoritative. This
@@ -1165,7 +1172,8 @@ async function startVisionCollector() {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
         },
-      browser: Browsers.ubuntu('Chrome'),
+      version: versionInfo.version,
+      browser: Browsers.macOS('Desktop'),
       // The collector only receives messages. Staying unavailable avoids the
       // Baileys 6 status-ack path that can also produce a 50-minute stream ACK
       // disconnect, while native WebSocket keep-alives remain enabled below.
