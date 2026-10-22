@@ -41,7 +41,8 @@ GROQ_API_KEY=gsk_your_groq_key
 GROQ_MODEL=qwen/qwen3.8-27b
 
 # Bot Settings
-# Bot 2 now uses QR pairing. WHATSAPP_PHONE_NUMBER is optional and not used for linking.
+# Phone-number pairing target (digits only, including country code). Defaults to 2349061484256.
+WHATSAPP_PHONE_NUMBER=2349061484256
 SESSION_DIR=/path/to/persistent/wa_vision_auth_session
 WHATSAPP_MONITOR_ALL_GROUPS=true
 WHATSAPP_MEDIA_INTAKE_CONCURRENCY=2
@@ -65,7 +66,7 @@ PUBLIC_SITE_URL=https://your-buysell-site.com
    - **Start Command:** `npm start`
    - **Plan:** `Free`
 2. Add the environment variables listed above.
-3. Open your service's `/pair` page on first run and scan the displayed **WhatsApp QR code**.
+3. Open your service's `/pair` page on first run and enter the displayed **WhatsApp phone-number pairing code**.
 4. Add your Render service URL to **UptimeRobot** (5-minute interval) to keep it awake 24/7.
 
 ### Required Render session storage
@@ -82,9 +83,9 @@ After the disk is attached, deploy once and pair the device one final time. Do n
 
 ### Pairing reliably
 
-Open `/pair` on the Bot 2 service. On the WhatsApp account Bot 2 should use, go to **Settings → Linked Devices → Link a device**, then scan the QR code shown on the page. Keep the page open because WhatsApp automatically refreshes QR codes.
+Open `/pair` on the Bot 2 service. On the WhatsApp account Bot 2 should use, go to **Settings → Linked Devices → Link a device → Link with phone number instead**, then enter the displayed code. Each code is valid for about 60 seconds.
 
-Bot 2 still prints the QR in Render logs as a fallback, but the `/pair` page is the easiest way to scan it. Use **Reset QR session** only after several failed scans.
+The `/pair` page and Render logs show the active code. Use **Generate fresh code** only after the current code expires or WhatsApp rejects it; use **Reset pairing session** only after several failed fresh codes.
 
 ## WhatsApp session safety
 
