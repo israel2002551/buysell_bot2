@@ -105,6 +105,18 @@ export class BuySellListingsApi {
     });
   }
 
+  authStateGet({ sessionId, keys }) {
+    return this.request({ action: 'auth_state_get', session_id: sessionId, keys });
+  }
+
+  authStateSet({ sessionId, entries }) {
+    return this.request({ action: 'auth_state_set', session_id: sessionId, entries });
+  }
+
+  authStateClear({ sessionId }) {
+    return this.request({ action: 'auth_state_clear', session_id: sessionId });
+  }
+
   finishListingJob({ jobId, lockToken, state, error = '', retryInSeconds = 60, result = {} } = {}) {
     return this.request({
       action: 'queue_finish',
