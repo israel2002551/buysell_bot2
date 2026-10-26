@@ -1154,7 +1154,9 @@ async function startVisionCollector() {
       ...(waWebVersion ? { version: waWebVersion } : {}),
       logger: pino({ level: 'silent' }),
       auth: state,
-      browser: Browsers.ubuntu('Chrome'),
+      // WhatsApp rejects phone-number linking for the Ubuntu identity
+      // ("Couldn't link device"); the macOS identity pairs successfully.
+      browser: Browsers.macOS('Chrome'),
       markOnlineOnConnect: true,
       syncFullHistory: false,
       connectTimeoutMs: 60_000,
