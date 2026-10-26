@@ -3,8 +3,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   extractMessageContent,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
+  fetchLatestWaWebVersion,
   normalizeMessageContent,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -13,6 +12,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node
 import http from 'node:http';
 import zlib from 'node:zlib';
 import pino from 'pino';
+import qrcode from 'qrcode-terminal';
 import sharp from 'sharp';
 import 'dotenv/config';
 import { parseListingWithVision, looksLikeSalePost, stripPriceFromText, hasPriceInText, transcribeVideoAudio } from './parser.js';
@@ -54,10 +54,7 @@ const envTargetGroups = (process.env.WHATSAPP_TARGET_GROUPS || '')
   .map(g => g.trim())
   .filter(g => g.endsWith('@g.us'));
 
-// Bot 2 is intentionally an allow-list collector. It imports only groups in
-// the configured database list, the legacy list below, or WHATSAPP_TARGET_GROUPS.
-// Do not allow an environment value to broaden this into every joined group.
-const monitorAllGroups = false;
+const monitorAllGroups = String(process.env.WHATSAPP_MONITOR_ALL_GROUPS || 'true').toLowerCase() === 'true';
 const mediaIntakeConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_MEDIA_INTAKE_CONCURRENCY || 2), 4));
 const stagingConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_STAGING_CONCURRENCY || 2), 4));
 const listingWorkerConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_LISTING_WORKER_CONCURRENCY || 1), 3));
@@ -145,38 +142,8 @@ let reconnectAttempts = 0;
 let keepAliveTimer = null;
 let collectorIsStarting = false;
 let warnedAboutSessionStorage = false;
-let connectionOpenedAt = 0;
-let connectionStabilityTimer = null;
-let consecutiveUnstableStreamFailures = 0;
-let sessionRecoveryRequired = false;
 
-// A socket can report "open" immediately before WhatsApp rejects its stale
-// encryption state. Only regard it as healthy after it survives for a minute.
-const STABLE_CONNECTION_MS = 60_000;
-const MAX_UNSTABLE_STREAM_FAILURES = 3;
-const BAILEYS_ACK_PATCH_MARKER = './node_modules/@whiskeysockets/baileys/.buysell-message-ack-patched';
-
-function clearConnectionStabilityTimer() {
-  if (connectionStabilityTimer) {
-    clearTimeout(connectionStabilityTimer);
-    connectionStabilityTimer = null;
-  }
-}
-
-function beginConnectionStabilityCheck(sock) {
-  clearConnectionStabilityTimer();
-  connectionStabilityTimer = setTimeout(() => {
-    if (activeSocket === sock && whatsappConnected) {
-      reconnectAttempts = 0;
-      consecutiveUnstableStreamFailures = 0;
-      sessionRecoveryRequired = false;
-      latestPairingError = null;
-      console.info('[Bot 2] WhatsApp connection remained stable; reconnect state cleared.');
-    }
-  }, STABLE_CONNECTION_MS);
-}
-
-// Live phone-number pairing state for web dashboard /pair and session recovery.
+// Live pairing state for web dashboard /pair and session recovery
 let latestPairingCode = null;
 let pairingCodeGeneratedAt = null;
 let pairingTargetPhone = null;
@@ -219,6 +186,8 @@ async function requestPairingCode(sock, phoneNumber, reason = 'manual request', 
   pairingCodeRequestSocket = sock;
   try {
     const code = await sock.requestPairingCode(phoneNumber, codeToReuse || undefined);
+    // A reset/reconnect can replace the socket while WhatsApp is processing the
+    // request. Never let that stale request replace the new session's code.
     if (sock !== activeSocket || whatsappConnected) return false;
     const rawCode = String(code || '').replace(/-/g, '').toUpperCase();
     const formatted = rawCode.match(/.{1,4}/g)?.join('-') || code;
@@ -229,15 +198,27 @@ async function requestPairingCode(sock, phoneNumber, reason = 'manual request', 
     pairingTargetPhone = phoneNumber;
     pairingCodeRequestAttempts = 0;
 
-    console.log(`\n[BOT 2 VISION] WHATSAPP PAIRING CODE FOR +${phoneNumber}: ${formatted}`);
-    console.log('On your phone: Linked Devices > Link a device > Link with phone number instead. Enter the code within 60 seconds.');
+    console.log('\n============================================================');
+    console.log(`[BOT 2 VISION] WHATSAPP PAIRING CODE FOR +${phoneNumber}: ${formatted}`);
+    console.log('============================================================');
+    console.log(`On your phone for Bot 2 (+${phoneNumber}):`);
+    console.log('1. Open WhatsApp -> Settings -> Linked Devices');
+    console.log('2. Ensure you have under 4 linked devices (remove old ones if needed)');
+    console.log('3. Tap "Link a device"');
+    console.log('4. Tap "Link with phone number instead" at the bottom');
+    console.log(`5. Enter code within 60s: ${formatted}\n`);
     return true;
-  } catch (error) {
-    latestPairingError = error?.message || String(error);
+  } catch (err) {
+    latestPairingError = err?.message || String(err);
     console.error(`[Bot 2] Failed to request pairing code (${reason}):`, latestPairingError);
+
+    // Render and WhatsApp can take longer than the original fixed 3-second wait
+    // to open the pairing socket. Retry the request a few times on the same fresh
+    // session so the phone receives a pairing prompt without the user resetting it.
     if (sock === activeSocket && !whatsappConnected && pairingCodeRequestAttempts < 3) {
       const retryDelays = [5_000, 10_000, 20_000];
-      schedulePairingCodeRequest(sock, phoneNumber, retryDelays[pairingCodeRequestAttempts++], 'automatic retry', codeToReuse);
+      const retryDelay = retryDelays[pairingCodeRequestAttempts++];
+      schedulePairingCodeRequest(sock, phoneNumber, retryDelay, 'automatic retry', codeToReuse);
     }
     return false;
   } finally {
@@ -278,6 +259,23 @@ function installSignalLogRedaction() {
   }
 }
 
+// The WhatsApp Web version bundled with Baileys goes stale between releases.
+// WhatsApp still opens the socket for an outdated client but rejects the
+// phone-number link step ("Couldn't link device"), so use the live version.
+let cachedWaWebVersion = null;
+async function resolveWaWebVersion() {
+  try {
+    const { version, isLatest } = await fetchLatestWaWebVersion({ timeout: 10_000 });
+    if (isLatest && Array.isArray(version)) {
+      cachedWaWebVersion = version;
+      console.info(`[Bot 2] Using WhatsApp Web version ${version.join('.')}.`);
+    }
+  } catch (error) {
+    console.warn('[Bot 2] Could not fetch the latest WhatsApp Web version:', error?.message || error);
+  }
+  return cachedWaWebVersion || undefined;
+}
+
 function safeCloseSocket(sock) {
   if (!sock) return;
   try {
@@ -313,10 +311,6 @@ function startKeepAlive(sock) {
 }
 
 function scheduleReconnect(immediate = false) {
-  if (sessionRecoveryRequired) {
-    console.warn('[Bot 2] Automatic reconnect paused: repair the WhatsApp session from /pair.');
-    return;
-  }
   if (reconnectTimer) return;
 
   // Delays with exponential backoff: 1s (immediate/515 restart), 3s, 5s, 10s, 20s, 30s, up to 60s
@@ -1085,21 +1079,13 @@ function onMessage(sock, message) {
 }
 
 async function startVisionCollector() {
-  if (!existsSync(BAILEYS_ACK_PATCH_MARKER)) {
-    sessionRecoveryRequired = true;
-    latestPairingError = 'The deployed image is missing the required WhatsApp acknowledgement patch. Rebuild Bot 2 from the current release.';
-    throw new Error('Required Baileys message-acknowledgement patch is absent. Rebuild the service from the current Docker image; do not run an unpatched collector.');
-  }
-  if (sessionRecoveryRequired) {
-    console.warn('[Bot 2] WhatsApp session repair is required before another connection can start.');
-    return;
-  }
   if (collectorIsStarting) return;
   if (activeSocket && whatsappConnected) return;
   collectorIsStarting = true;
 
   try {
     if (activeSocket) {
+      clearPairingCodeRequestTimer();
       safeCloseSocket(activeSocket);
       activeSocket = null;
     }
@@ -1133,19 +1119,25 @@ async function startVisionCollector() {
     let state = auth.state;
     let saveCreds = auth.saveCreds;
 
-    // A stale, unregistered pairing key makes WhatsApp reject the next code.
-    // During a short reconnect, preserve the key and reuse the still-valid code
-    // instead of invalidating it while it is being entered.
+    // If session is NOT registered, ensure clean crypto keys for pairing
     if (!state.creds.registered && phoneNumber) {
       let previousTarget = '';
       try {
-        if (existsSync(pairingTargetFile)) previousTarget = readFileSync(pairingTargetFile, 'utf-8').trim();
+        if (existsSync(pairingTargetFile)) {
+          previousTarget = readFileSync(pairingTargetFile, 'utf-8').trim();
+        }
       } catch {}
+
+      // Preserve the active pairing key for a short reconnect. Resetting it while
+      // the user is typing the displayed code invalidates that code and results in
+      // WhatsApp's "Couldn't link device" error. Old/expired attempts still get a
+      // clean session because WhatsApp codes have a short lifetime.
       const hasOldPairingState = Boolean(state.creds.me || state.creds.pairingCode);
       const phoneMismatch = Boolean(previousTarget && previousTarget !== phoneNumber);
       const resumeActivePairing = !phoneMismatch && hasOldPairingState && canReuseActivePairingCode(phoneNumber);
+
       if (phoneMismatch || (hasOldPairingState && !resumeActivePairing)) {
-        console.warn(`[Session] Resetting unregistered pairing files for +${phoneNumber} to guarantee clean keys...`);
+        console.warn(`[Session] Resetting un-registered session files for +${phoneNumber} to guarantee clean pairing keys...`);
         try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
         mkdirSync(sessionDir, { recursive: true });
         auth = await useMultiFileAuthState(sessionDir);
@@ -1157,27 +1149,13 @@ async function startVisionCollector() {
       try { writeFileSync(pairingTargetFile, phoneNumber, 'utf-8'); } catch {}
     }
 
-    // Pairing codes are validated against WhatsApp's current companion protocol.
-    // Fetch the current version before creating the socket instead of relying on
-    // the version bundled with this older Baileys release.
-    const versionInfo = await fetchLatestBaileysVersion({ timeout: 12_000 });
-    console.info(`[WhatsApp Protocol] Using version ${versionInfo.version.join('.')} (${versionInfo.isLatest ? 'current' : 'bundled fallback'}).`);
-
+    const waWebVersion = await resolveWaWebVersion();
     const sock = makeWASocket({
+      ...(waWebVersion ? { version: waWebVersion } : {}),
       logger: pino({ level: 'silent' }),
-        // Cache key reads while keeping the underlying store authoritative. This
-        // avoids a file read for every encrypted message and reduces the chance
-        // of auth-key I/O falling behind under busy group traffic.
-        auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
-        },
-      version: versionInfo.version,
-      browser: Browsers.macOS('Desktop'),
-      // The collector only receives messages. Staying unavailable avoids the
-      // Baileys 6 status-ack path that can also produce a 50-minute stream ACK
-      // disconnect, while native WebSocket keep-alives remain enabled below.
-      markOnlineOnConnect: false,
+      auth: state,
+      browser: Browsers.ubuntu('Chrome'),
+      markOnlineOnConnect: true,
       syncFullHistory: false,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
@@ -1203,14 +1181,10 @@ async function startVisionCollector() {
     });
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-      // A delayed event from a socket we have already replaced must not change
-      // the status or restart the collector for the current socket.
-      if (activeSocket !== sock) {
-        if (connection === 'close') safeCloseSocket(sock);
-        return;
-      }
-      // Baileys emits a QR reference even for phone-number pairing. It confirms
-      // the socket is ready; only then request the code WhatsApp can accept.
+      // Baileys emits a QR reference even for phone-number pairing. Waiting for
+      // this event ensures the WebSocket is ready before registering the code.
+      // Requesting it from a fixed startup timer can produce a code that the
+      // phone displays but WhatsApp never accepts.
       if (qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
         pairingCodeRequestedOnSocket = true;
         pairingCodeRequestAttempts = 0;
@@ -1218,42 +1192,36 @@ async function startVisionCollector() {
           sock,
           phoneNumber,
           0,
-          pairingCodeForReconnect ? 'transient reconnect' : 'socket-ready pairing request',
+          pairingCodeForReconnect ? 'transient reconnect' : 'QR-ready pairing request',
           pairingCodeForReconnect,
         );
       }
+      if (qr && !phoneNumber) {
+        console.log('[BOT 2 VISION] Scan this QR code to link:');
+        qrcode.generate(qr, { small: true });
+      }
       if (connection === 'open') {
         whatsappConnected = true;
-        connectionOpenedAt = Date.now();
-        beginConnectionStabilityCheck(sock);
+        reconnectAttempts = 0;
         clearPairingCodeRequestTimer();
         latestPairingCode = null;
         pairingCodeGeneratedAt = null;
         activePairingCodeRaw = null;
         console.log(`BUYSELL WhatsApp Vision Collector (Bot 2) is active and connected as +${sock?.user?.id?.split(':')[0] || phoneNumber}.`);
+        sock.sendPresenceUpdate('available').catch(() => {});
+        startKeepAlive(sock);
         startListingQueuePolling();
       }
       if (connection === 'close') {
         await credsSavePromise;
-        clearConnectionStabilityTimer();
-        const connectionLifetimeMs = connectionOpenedAt ? Date.now() - connectionOpenedAt : 0;
-        connectionOpenedAt = 0;
         whatsappConnected = false;
         clearPairingCodeRequestTimer();
         stopKeepAlive();
         const code = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = code === DisconnectReason.loggedOut;
         const isRestartRequired = code === DisconnectReason.restartRequired;
-        const closeReason = lastDisconnect?.error?.message || 'unknown';
-        const isAckStreamError = code === 500 && /stream\s+errored.*ack/i.test(closeReason);
-        const wasShortLived = connectionLifetimeMs > 0 && connectionLifetimeMs < STABLE_CONNECTION_MS;
-        const isUnstableStreamFailure = isAckStreamError || wasShortLived;
 
-        consecutiveUnstableStreamFailures = isUnstableStreamFailure
-          ? consecutiveUnstableStreamFailures + 1
-          : 0;
-
-        console.warn(`[Bot 2] WhatsApp connection closed (code: ${code ?? 'unknown'}, reason: ${closeReason}, lifetime: ${connectionLifetimeMs || 0}ms).`);
+        console.warn(`[Bot 2] WhatsApp connection closed (code: ${code ?? 'unknown'}, reason: ${lastDisconnect?.error?.message || 'unknown'}).`);
 
         if (activeSocket === sock) {
           activeSocket = null;
@@ -1263,14 +1231,8 @@ async function startVisionCollector() {
         if (isLoggedOut) {
           console.warn('[Session] Session unlinked. Resetting session directory and requesting a fresh pairing.');
           try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
-          sessionRecoveryRequired = false;
-          consecutiveUnstableStreamFailures = 0;
           reconnectAttempts = 0;
           scheduleReconnect(false);
-        } else if (consecutiveUnstableStreamFailures >= MAX_UNSTABLE_STREAM_FAILURES) {
-          sessionRecoveryRequired = true;
-          latestPairingError = 'WhatsApp rejected this saved session repeatedly. Select Repair WhatsApp session below, then link using one new phone-number code.';
-          console.error(`[Bot 2] Pausing reconnect after ${consecutiveUnstableStreamFailures} unstable stream failures. Session repair is required.`);
         } else if (isRestartRequired) {
           console.info('[Bot 2] Restart required by WhatsApp. Reconnecting immediately...');
           scheduleReconnect(true);
@@ -1360,12 +1322,22 @@ if (port) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
 
+    // Ask WhatsApp to send the phone-link prompt again without discarding the
+    // active pairing handshake. This is safer and faster than resetting keys.
+    if (pathname === '/request-pairing-code') {
+      if (!whatsappConnected && activeSocket && pairingTargetPhone) {
+        await requestPairingCode(activeSocket, pairingTargetPhone, 'manual dashboard request');
+      }
+      res.writeHead(302, { Location: '/pair' });
+      res.end();
+      return;
+    }
+
     // Reset session endpoint to force clean cryptographic keys without redeploying
     if (pathname === '/reset-session') {
-      const forceRepair = url.searchParams.get('force') === '1';
-      if (whatsappConnected && !forceRepair) {
+      if (whatsappConnected) {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h3>Bot 2 is already connected to WhatsApp!</h3><p>If it is not receiving messages, use the Repair WhatsApp session button on the pairing page.</p><p><a href="/pair">Go back</a></p>');
+        res.end('<h3>Bot 2 is already connected to WhatsApp!</h3><p>Unlink from your phone if you wish to re-pair.</p><p><a href="/pair">Go back</a></p>');
         return;
       }
       const requestedPhone = url.searchParams.get('phone');
@@ -1376,37 +1348,22 @@ if (port) {
           console.info(`[HTTP] Target phone updated to +${pairingTargetPhone}`);
         }
       }
-      console.warn(`[HTTP] ${forceRepair ? 'Session repair' : 'Manual session reset'} requested. Wiping saved WhatsApp session files...`);
+      console.warn('[HTTP] Manual session reset requested. Wiping unlinked session files...');
       stopKeepAlive();
-      clearConnectionStabilityTimer();
-      connectionOpenedAt = 0;
+      clearPairingCodeRequestTimer();
+      pairingCodeRequestAttempts = 0;
       if (activeSocket) {
         safeCloseSocket(activeSocket);
         activeSocket = null;
       }
       const sessionDir = process.env.SESSION_DIR || './wa_vision_auth_session';
       try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
-      clearPairingCodeRequestTimer();
-      pairingCodeRequestAttempts = 0;
       latestPairingCode = null;
       pairingCodeGeneratedAt = null;
       activePairingCodeRaw = null;
       latestPairingError = null;
       reconnectAttempts = 0;
-      consecutiveUnstableStreamFailures = 0;
-      sessionRecoveryRequired = false;
       scheduleReconnect(true);
-      res.writeHead(302, { Location: '/pair' });
-      res.end();
-      return;
-    }
-
-    // Request a new code only when the user explicitly asks. This retains the
-    // normal code for its full lifetime and avoids changing it mid-entry.
-    if (pathname === '/request-pairing-code') {
-      if (!whatsappConnected && activeSocket && pairingTargetPhone) {
-        await requestPairingCode(activeSocket, pairingTargetPhone, 'manual dashboard request');
-      }
       res.writeHead(302, { Location: '/pair' });
       res.end();
       return;
@@ -1420,7 +1377,6 @@ if (port) {
         code_age_seconds: codeAgeSeconds,
         code_expired: codeAgeSeconds !== null && codeAgeSeconds > 60,
         error: latestPairingError,
-        recovery_required: sessionRecoveryRequired,
       });
       return;
     }
@@ -1428,12 +1384,12 @@ if (port) {
     // Interactive web pairing dashboard
     if (pathname === '/pair' || (pathname === '/' && req.headers.accept?.includes('text/html'))) {
       const isConnected = whatsappConnected;
-      const linkedPhone = activeSocket?.user?.id?.split(':')[0] || 'your WhatsApp account';
       const targetPhone = pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256';
       const code = latestPairingCode;
       const rawCode = code ? code.replace(/-/g, '') : '';
       const codeAge = pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null;
-      const remainingSec = codeAge === null ? null : Math.max(0, 60 - codeAge);
+      const codeExpired = codeAge !== null && codeAge > 60;
+      const remainingSec = codeAge ? Math.max(0, 60 - codeAge) : 60;
 
       const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1441,6 +1397,7 @@ if (port) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BUYSELL Bot 2 - WhatsApp Pairing</title>
+  <meta http-equiv="refresh" content="${isConnected ? '30' : '15'}">
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; }
@@ -1467,16 +1424,26 @@ if (port) {
   <div class="card">
     <h1>🤖 BUYSELL Bot 2 Collector</h1>
     ${isConnected ? `
-      <div class="status online">● Connected & Active (${linkedPhone})</div>
+      <div class="status online">● Connected & Active (+${targetPhone})</div>
       <p style="color: #cbd5e1; font-size: 14px; line-height: 1.6;">WhatsApp Vision Collector is actively monitoring WhatsApp seller groups and indexing products with AI.</p>
     ` : `
       <div class="status waiting">⏳ Awaiting WhatsApp Linking</div>
       <p style="margin: 0; color: #94a3b8; font-size: 14px;">Target phone: <strong style="color: #f8fafc;">+${targetPhone}</strong></p>
+      
       <div class="code-box">
         <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #94a3b8; margin-bottom: 6px;">Active 8-Character Pairing Code</div>
-        <div id="pairing-code" class="code">${code || 'Generating...'}</div>
-        <div id="pairing-code-status" class="timer">${code ? `Valid for about ${remainingSec}s. Enter it now.` : 'Connecting to WhatsApp pairing server...'}</div>
-        ${code ? `<button type="button" class="btn btn-secondary" style="margin-top: 12px; font-size: 12px; padding: 6px 14px;" onclick="navigator.clipboard.writeText('${rawCode}')">Copy code</button>` : ''}
+        <div class="code">${code || 'Generating...'}</div>
+        <div class="timer">
+          ${code ? (codeExpired
+            ? '<strong style="color:#f87171;">⚠️ Code expired (>60s). Click "Generate Fresh Code" below.</strong>'
+            : `⏳ Valid for another <strong>${remainingSec}s</strong> (auto-refreshes every 5s)`)
+          : 'Connecting to WhatsApp pairing server...'}
+        </div>
+        ${code ? `
+          <button type="button" class="btn btn-secondary" style="margin-top: 12px; font-size: 12px; padding: 6px 14px;" onclick="navigator.clipboard.writeText('${rawCode}'); this.innerText='✓ Copied!'; setTimeout(() => this.innerText='📋 Copy Code', 2000);">
+            📋 Copy Code
+          </button>
+        ` : ''}
       </div>
 
       ${latestPairingError ? `
@@ -1486,69 +1453,46 @@ if (port) {
       ` : ''}
 
       <div class="steps">
-        <strong style="color: #38bdf8;">On the phone with the WhatsApp account for Bot 2:</strong>
+        <strong style="color: #38bdf8;">On phone +${targetPhone}:</strong>
         <ol>
           <li>Open WhatsApp &rarr; <strong>Settings</strong> (or <strong>⋮</strong> menu) &rarr; <strong>Linked Devices</strong>.</li>
           <li><strong>Check limit:</strong> If you already have 4 linked devices, log out of one.</li>
           <li>Tap <strong>Link a device</strong>.</li>
-          <li>Tap <strong>Link with phone number instead</strong> at the bottom.</li>
-          <li>Enter the 8-character code shown above.</li>
+          <li>Tap <strong>"Link with phone number instead"</strong> at the bottom.</li>
+          <li>Type code: <strong style="color: #38bdf8; font-family: monospace; font-size: 15px;">${code || '...'}</strong></li>
         </ol>
       </div>
 
       <form action="/request-pairing-code" method="GET" style="margin-top: 14px;">
-        <button type="submit" class="btn btn-secondary" style="width: 100%;">Generate fresh code</button>
+        <button type="submit" class="btn btn-secondary" style="width: 100%;">Send pairing prompt / fresh code again</button>
       </form>
-      <form action="/reset-session?force=1" method="GET" style="margin-top: 14px;">
-        <button type="submit" class="btn btn-secondary" style="width: 100%;">Repair WhatsApp session</button>
+      <p style="margin: 8px 0 0; color: #94a3b8; font-size: 12px; line-height: 1.45;">If the phone notification is delayed or hidden, stay on the WhatsApp code-entry screen and use the code shown above. This button asks WhatsApp to send the linking prompt again without deleting the current session.</p>
+
+      <form action="/reset-session" method="GET" style="margin-top: 14px;">
+        <label style="display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px;">Last resort only — changing the phone number or WhatsApp says it could not link?</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="tel" name="phone" value="${targetPhone}" placeholder="09061484256" class="phone-input" />
+          <button type="submit" class="btn">🔄 New Code</button>
+        </div>
       </form>
 
-      <div id="pairing-tip" class="warn">
-        💡 <strong>Tip:</strong> Keep this page open while entering the code. Generate a fresh code only after it expires or WhatsApp rejects it.
+      <div class="warn">
+        💡 <strong>Tip:</strong> If WhatsApp displays <em>"Couldn't link device"</em>, tap <strong>New Code</strong> above to reset the crypto handshake keys, and make sure your phone has fewer than 4 linked devices.
       </div>
     `}
   </div>
   ${isConnected ? '' : `<script>
-    let currentCode = ${JSON.stringify(code)};
-    const codeElement = document.getElementById('pairing-code');
-    const codeStatus = document.getElementById('pairing-code-status');
-    const pairingTip = document.getElementById('pairing-tip');
-    if (pairingTip) pairingTip.textContent = 'Use Generate fresh code only after the current code expires or WhatsApp rejects it. Do not reset the pairing session while entering a valid code.';
-
-    function updateCodeDisplay(status) {
-      if (status.connected) {
-        window.location.reload();
-        return;
-      }
-      if (status.code && status.code !== currentCode) {
-        codeElement.textContent = status.code;
-        currentCode = status.code;
-      }
-      if (!status.code) {
-        codeElement.textContent = 'Generating...';
-        codeStatus.textContent = status.recovery_required
-          ? 'Session repair required. Select Repair WhatsApp session below.'
-          : 'Connecting to WhatsApp pairing server...';
-        if (status.recovery_required && pairingTip) {
-          pairingTip.textContent = 'WhatsApp rejected the saved session repeatedly. Select Repair WhatsApp session once, then enter the newly generated phone-number code.';
-        }
-        return;
-      }
-      const age = Number.isFinite(status.code_age_seconds) ? status.code_age_seconds : 0;
-      const remaining = Math.max(0, 60 - age);
-      codeStatus.textContent = remaining > 0
-        ? 'Valid for about ' + remaining + 's. Enter it now.'
-        : 'Code expired. Use Generate fresh code.';
-    }
-
+    const pairingSnapshot = ${JSON.stringify({ code, error: latestPairingError })};
     setInterval(() => {
       fetch('/pair/status', { cache: 'no-store' })
         .then(response => response.ok ? response.json() : null)
         .then(status => {
-          if (status) updateCodeDisplay(status);
+          if (status && (status.connected || status.code !== pairingSnapshot.code || status.error !== pairingSnapshot.error)) {
+            window.location.reload();
+          }
         })
         .catch(() => {});
-    }, 1000);
+    }, 2500);
   </script>`}
 </body>
 </html>`;
@@ -1568,16 +1512,13 @@ if (port) {
       all_groups_monitored: monitorAllGroups,
       whatsapp_connected: whatsappConnected,
       reconnect_attempts: reconnectAttempts,
-      session_recovery_required: sessionRecoveryRequired,
-        pairing: {
-          connected: whatsappConnected,
-          method: 'phone_number',
-          target_phone: pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256',
-          code: latestPairingCode,
-          generated_seconds_ago: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
-          error: latestPairingError,
-          recovery_required: sessionRecoveryRequired,
-        },
+      pairing: {
+        connected: whatsappConnected,
+        target_phone: pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256',
+        code: latestPairingCode,
+        generated_seconds_ago: pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null,
+        error: latestPairingError,
+      },
       poll_interval_ms: currentPollIntervalMs,
       max_media_bytes: MAX_MEDIA_BYTES,
       queue: {
