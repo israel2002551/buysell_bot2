@@ -1,13 +1,11 @@
 import {
   BufferJSON,
   initAuthCreds,
-  makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
-import pino from 'pino';
 
 // Matches useMultiFileAuthState's file naming so a local session folder can be
 // uploaded as-is: `creds.json` -> `creds`, `session-123.0.json` -> `session-123.0`.
@@ -84,73 +82,145 @@ export function chunkEntries(entries, maxCount = 100, maxChars = 1_500_000) {
   return chunks;
 }
 
-async function openSupabaseAuthState(api) {
+// One in-memory session per API client and process, so a socket reconnect
+// reuses it instead of reloading (and cannot race unsaved writes).
+const supabaseStores = new WeakMap();
+
+function openSupabaseAuthState(api) {
+  if (!supabaseStores.has(api)) {
+    const opening = createSupabaseAuthState(api, () => supabaseStores.delete(api));
+    supabaseStores.set(api, opening);
+    opening.catch(() => supabaseStores.delete(api));
+  }
+  return supabaseStores.get(api);
+}
+
+/** Test hook: behave like a fresh process. */
+export function forgetSupabaseAuthStates(api) {
+  supabaseStores.delete(api);
+}
+
+/**
+ * Keeps the whole session in memory and saves changes to Supabase in the
+ * background. Signal key reads and writes happen on every incoming message;
+ * waiting on the network for each one made message handling so slow that
+ * WhatsApp closed the connection for missing acknowledgements
+ * ("Stream Errored (ack)").
+ */
+async function createSupabaseAuthState(api, onClear) {
   const sessionId = authSessionId();
   const cipher = createAuthCipher(sessionId);
 
-  const readValues = async (names) => {
-    const values = {};
-    for (const part of chunk(names, 200)) {
-      const result = await api.authStateGet({ sessionId, keys: part });
-      for (const [name, stored] of Object.entries(result?.values || {})) {
-        values[name] = JSON.parse(cipher.decrypt(name, stored), BufferJSON.reviver);
-      }
+  // JSON text per key, exactly as the session files store it; null = known absent.
+  const memory = new Map();
+  let fullyLoaded = false;
+  try {
+    let after = null;
+    do {
+      const page = await api.authStateList({ sessionId, after });
+      for (const [name, stored] of Object.entries(page?.values || {})) memory.set(name, cipher.decrypt(name, stored));
+      after = page?.next || null;
+    } while (after);
+    fullyLoaded = true;
+  } catch (error) {
+    if (!/unknown action/i.test(error?.message || '')) throw error;
+    // Edge Function without auth_state_list: fetch each key once, on first use.
+    memory.clear();
+  }
+
+  const ensureLoaded = async (names) => {
+    if (fullyLoaded) return;
+    const missing = [...new Set(names)].filter(name => !memory.has(name));
+    for (const part of chunk(missing, 200)) {
+      const values = (await api.authStateGet({ sessionId, keys: part }))?.values || {};
+      for (const name of part) memory.set(name, name in values ? cipher.decrypt(name, values[name]) : null);
     }
-    return values;
+  };
+  const readValue = (name) => {
+    const text = memory.get(name);
+    return text == null ? null : JSON.parse(text, BufferJSON.reviver);
   };
 
-  // Writes are applied strictly in order: Signal ratchets overwrite and delete
-  // the same keys in quick succession, and a reordered write corrupts sessions.
-  let writeChain = Promise.resolve();
-  const writeValues = (entries) => {
-    const run = writeChain.then(async () => {
-      const encrypted = entries.map(({ name, value }) => ({
-        key: name,
-        value: value === null ? null : cipher.encrypt(name, JSON.stringify(value, BufferJSON.replacer)),
-      }));
-      for (const part of chunkEntries(encrypted)) {
-        await api.authStateSet({ sessionId, entries: part });
-      }
-    });
-    writeChain = run.catch(() => {});
-    return run;
+  // Writes are coalesced per key and saved strictly in order: Signal ratchets
+  // overwrite and delete the same keys in quick succession.
+  const pending = new Map();
+  let flushing = Promise.resolve();
+  let flushTimer = null;
+  let failures = 0;
+
+  const schedule = (delayMs = 300) => {
+    if (!flushTimer) flushTimer = setTimeout(() => { flushTimer = null; void flush(); }, delayMs);
+  };
+  const persist = async () => {
+    if (!pending.size) return;
+    const batch = [...pending];
+    pending.clear();
+    try {
+      const encrypted = batch.map(([name, text]) => ({ key: name, value: text === null ? null : cipher.encrypt(name, text) }));
+      for (const part of chunkEntries(encrypted)) await api.authStateSet({ sessionId, entries: part });
+      failures = 0;
+    } catch (error) {
+      // Keep anything a newer write has not replaced, then retry with backoff.
+      for (const [name, text] of batch) if (!pending.has(name)) pending.set(name, text);
+      failures += 1;
+      console.warn(`[Session] Could not save the WhatsApp session to Supabase (attempt ${failures}); retrying.`, error?.message || error);
+      schedule(Math.min(30_000, 1_000 * 2 ** Math.min(failures, 5)));
+    }
+  };
+  const flush = () => {
+    flushing = flushing.then(persist, persist);
+    return flushing;
+  };
+  const flushNow = () => {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    return flush();
+  };
+  const write = (name, value) => {
+    const text = value == null ? null : JSON.stringify(value, BufferJSON.replacer);
+    memory.set(name, text);
+    pending.set(name, text);
+    schedule();
   };
 
-  const creds = (await readValues(['creds'])).creds || initAuthCreds();
+  await ensureLoaded(['creds']);
+  const creds = readValue('creds') || initAuthCreds();
   const keys = {
     get: async (type, ids) => {
       const names = ids.map(id => authKeyName(type, id));
-      const values = await readValues(names);
+      await ensureLoaded(names);
       const data = {};
       ids.forEach((id, index) => {
-        let value = values[names[index]] ?? null;
+        let value = readValue(names[index]);
         if (type === 'app-state-sync-key' && value) value = proto.Message.AppStateSyncKeyData.fromObject(value);
         data[id] = value;
       });
       return data;
     },
     set: async (data) => {
-      const entries = [];
       for (const type in data) {
-        for (const id in data[type]) {
-          entries.push({ name: authKeyName(type, id), value: data[type][id] || null });
-        }
+        for (const id in data[type]) write(authKeyName(type, id), data[type][id] || null);
       }
-      if (entries.length) await writeValues(entries);
     },
   };
 
   return {
-    state: {
-      creds,
-      keys: makeCacheableSignalKeyStore(keys, pino({ level: 'silent' })),
+    state: { creds, keys },
+    // Resolves once everything queued so far is in Supabase; the post-pairing
+    // restart must find the new credentials there.
+    saveCreds: () => {
+      write('creds', creds);
+      return flushNow();
     },
-    saveCreds: () => writeValues([{ name: 'creds', value: creds }]),
+    flush: flushNow,
     clear: async () => {
-      await writeChain;
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      pending.clear();
+      await flushing;
       await api.authStateClear({ sessionId });
+      memory.clear();
+      onClear();
     },
-    description: `Supabase (session "${sessionId}")`,
+    description: `Supabase (session "${sessionId}", ${fullyLoaded ? `${memory.size} keys loaded` : 'loaded on demand'})`,
   };
 }
 
@@ -160,6 +230,7 @@ async function openFileAuthState(sessionDir) {
   return {
     state,
     saveCreds,
+    flush: async () => {},
     clear: async () => {
       try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
       mkdirSync(sessionDir, { recursive: true });

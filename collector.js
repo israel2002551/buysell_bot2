@@ -346,19 +346,18 @@ process.on('unhandledRejection', (reason) => {
   if (reason?.stack) console.error(reason.stack);
 });
 
-process.on('SIGINT', () => {
-  console.info('[Bot 2] Received SIGINT. Shutting down gracefully...');
+// Session changes are saved to Supabase in the background; give the last ones
+// a few seconds to finish before a deploy or restart stops the process.
+function shutdown(signal) {
+  console.info(`[Bot 2] Received ${signal}. Shutting down gracefully...`);
   stopKeepAlive();
   safeCloseSocket(activeSocket);
-  process.exit(0);
-});
+  Promise.race([Promise.resolve(activeAuth?.flush?.()).catch(() => {}), delay(8_000)])
+    .finally(() => process.exit(0));
+}
 
-process.on('SIGTERM', () => {
-  console.info('[Bot 2] Received SIGTERM. Shutting down gracefully...');
-  stopKeepAlive();
-  safeCloseSocket(activeSocket);
-  process.exit(0);
-});
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 installSignalLogRedaction();
 
@@ -1155,7 +1154,8 @@ async function startVisionCollector() {
     const waWebVersion = await resolveWaWebVersion();
     const sock = makeWASocket({
       ...(waWebVersion ? { version: waWebVersion } : {}),
-      logger: pino({ level: 'silent' }),
+      // Set BAILEYS_LOG_LEVEL=error to see connection/message errors while diagnosing.
+      logger: pino({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' }),
       auth: state,
       // WhatsApp rejects phone-number linking for the Ubuntu identity
       // ("Couldn't link device"); the macOS identity pairs successfully.

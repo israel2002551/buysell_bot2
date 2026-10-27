@@ -105,6 +105,10 @@ export class BuySellListingsApi {
     });
   }
 
+  authStateList({ sessionId, after = null }) {
+    return this.request({ action: 'auth_state_list', session_id: sessionId, after });
+  }
+
   authStateGet({ sessionId, keys }) {
     return this.request({ action: 'auth_state_get', session_id: sessionId, keys });
   }
