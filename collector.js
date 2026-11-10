@@ -314,12 +314,12 @@ function startKeepAlive(sock) {
   }, 30_000);
 }
 
-function scheduleReconnect(immediate = false) {
+function scheduleReconnect(immediate = false, delayMs = null) {
   if (reconnectTimer) return;
 
   // Delays with exponential backoff: 1s (immediate/515 restart), 3s, 5s, 10s, 20s, 30s, up to 60s
   const delays = [3_000, 5_000, 10_000, 20_000, 30_000, 60_000];
-  const delay = immediate ? 1_000 : delays[Math.min(reconnectAttempts, delays.length - 1)];
+  const delay = delayMs ?? (immediate ? 1_000 : delays[Math.min(reconnectAttempts, delays.length - 1)]);
 
   console.info(`[Bot 2] WhatsApp reconnect scheduled in ${(delay / 1000).toFixed(0)}s (retry attempt #${reconnectAttempts + 1})...`);
 
@@ -1278,6 +1278,13 @@ async function startVisionCollector() {
         } else if (isRestartRequired) {
           console.info('[Bot 2] Restart required by WhatsApp. Reconnecting immediately...');
           scheduleReconnect(true);
+        } else if (code === DisconnectReason.connectionReplaced) {
+          // Another copy of Bot 2 took over this WhatsApp session, usually the new
+          // copy started by a deploy while this one still runs. Reconnecting at once
+          // makes the two fight over one session until WhatsApp logs the device out
+          // (which wipes the stored session), so give the other copy time to stop.
+          console.warn('[Bot 2] Another copy of Bot 2 took over the WhatsApp connection. Reconnecting in 3 minutes.');
+          scheduleReconnect(false, 3 * 60_000);
         } else {
           reconnectAttempts++;
           scheduleReconnect(false);
