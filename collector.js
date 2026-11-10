@@ -11,7 +11,6 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import pino from 'pino';
-import qrcode from 'qrcode-terminal';
 import sharp from 'sharp';
 import 'dotenv/config';
 import { parseListingWithVision, looksLikeSalePost, stripPriceFromText, hasPriceInText, transcribeVideoAudio } from './parser.js';
@@ -21,6 +20,7 @@ import { sendSellerCommandResult, sendSellerConfirmation, sendSellerBatchConfirm
 import { KeyedTaskQueue } from './queue.js';
 import { authStoreMode, openAuthState } from './auth-store.js';
 import { SellerPhones, usablePhone } from './seller-phone.js';
+import { pairPasswordMatches, qrSvg } from './pair-page.js';
 
 const api = new BuySellListingsApi();
 // Real numbers of sellers WhatsApp names only by a private ID (see seller-phone.js).
@@ -157,6 +157,15 @@ let pairingCodeRequestTimer = null;
 let pairingCodeRequestSocket = null;
 let pairingCodeRequestAttempts = 0;
 const PAIRING_CODE_REUSE_WINDOW_MS = 55_000;
+
+// How Bot 2 links to WhatsApp when it has no session: "qr" (the default) shows
+// a QR code on /pair to scan, "code" asks WhatsApp for a phone-number link code.
+// In November 2026 WhatsApp refused every phone-number code, on Render and from
+// a PC alike, while QR codes linked straight away.
+const PAIRING_METHOD = String(process.env.WHATSAPP_PAIRING_METHOD || 'qr').trim().toLowerCase() === 'code' ? 'code' : 'qr';
+const QR_FRESH_MS = 60_000;
+let latestQr = null;
+let latestQrAt = null;
 
 function clearPairingCodeRequestTimer() {
   if (pairingCodeRequestTimer) {
@@ -1155,8 +1164,10 @@ async function startVisionCollector() {
     let state = auth.state;
     let saveCreds = auth.saveCreds;
 
-    // If session is NOT registered, ensure clean crypto keys for pairing
-    if (!state.creds.registered && phoneNumber) {
+    // Phone-number pairing only: if the session is NOT registered, ensure clean
+    // crypto keys. (A QR scan leaves the session unregistered until it opens, and
+    // this reset would wipe it on the reconnect WhatsApp asks for right after.)
+    if (PAIRING_METHOD === 'code' && !state.creds.registered && phoneNumber) {
       let previousTarget = '';
       try {
         if (existsSync(pairingTargetFile)) {
@@ -1224,7 +1235,7 @@ async function startVisionCollector() {
       // this event ensures the WebSocket is ready before registering the code.
       // Requesting it from a fixed startup timer can produce a code that the
       // phone displays but WhatsApp never accepts.
-      if (qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
+      if (PAIRING_METHOD === 'code' && qr && phoneNumber && !state.creds.registered && !pairingCodeRequestedOnSocket) {
         pairingCodeRequestedOnSocket = true;
         pairingCodeRequestAttempts = 0;
         schedulePairingCodeRequest(
@@ -1235,11 +1246,32 @@ async function startVisionCollector() {
           pairingCodeForReconnect,
         );
       }
-      if (qr && !phoneNumber) {
-        console.log('[BOT 2 VISION] Scan this QR code to link:');
-        qrcode.generate(qr, { small: true });
+      if (qr && PAIRING_METHOD === 'qr') {
+        if (!latestQr) {
+          console.log('[BOT 2 VISION] Not linked yet. Open /pair on this service and scan the QR code from WhatsApp > Linked devices > Link a device.');
+        }
+        latestQr = qr;
+        latestQrAt = Date.now();
       }
       if (connection === 'open') {
+        if (!state.creds.registered) {
+          // A QR link. Baileys only marks phone-code links as registered, and an
+          // unregistered session counts as unlinked, so mark it now. A QR code
+          // links whoever scans it, so refuse any account that isn't Bot 2's.
+          const linkedNumber = String(sock?.user?.id || '').split(':')[0];
+          if (phoneNumber && linkedNumber && linkedNumber !== phoneNumber) {
+            console.error(`[Session] The QR code was scanned by +${linkedNumber}, not Bot 2's number +${phoneNumber}. Unlinking that account.`);
+            await sock.logout().catch(() => {});
+            return;
+          }
+          state.creds.registered = true;
+          credsSavePromise = credsSavePromise
+            .then(() => saveCreds())
+            .catch(error => console.error('[Session] Could not persist WhatsApp credentials:', error?.message || error));
+          console.info(`[Session] Linked by QR code to +${linkedNumber}.`);
+        }
+        latestQr = null;
+        latestQrAt = null;
         whatsappConnected = true;
         reconnectAttempts = 0;
         clearPairingCodeRequestTimer();
@@ -1285,6 +1317,11 @@ async function startVisionCollector() {
           // (which wipes the stored session), so give the other copy time to stop.
           console.warn('[Bot 2] Another copy of Bot 2 took over the WhatsApp connection. Reconnecting in 3 minutes.');
           scheduleReconnect(false, 3 * 60_000);
+        } else if (PAIRING_METHOD === 'qr' && !state.creds.registered) {
+          // Still waiting for a scan: WhatsApp ends each batch of QR codes after
+          // about a minute, so fetch the next batch promptly.
+          reconnectAttempts = 0;
+          scheduleReconnect(false, 3_000);
         } else {
           reconnectAttempts++;
           scheduleReconnect(false);
@@ -1433,6 +1470,9 @@ if (port) {
       const codeAgeSeconds = pairingCodeGeneratedAt ? Math.round((Date.now() - pairingCodeGeneratedAt) / 1000) : null;
       sendCompressedResponse(req, res, 200, {
         connected: whatsappConnected,
+        method: PAIRING_METHOD,
+        // The QR code itself is only shown on the password-protected /pair page.
+        qr_ready: PAIRING_METHOD === 'qr' && Boolean(latestQr && Date.now() - latestQrAt < QR_FRESH_MS),
         code: latestPairingCode,
         code_age_seconds: codeAgeSeconds,
         code_expired: codeAgeSeconds !== null && codeAgeSeconds > 60,
@@ -1441,7 +1481,45 @@ if (port) {
       return;
     }
 
-    // Interactive web pairing dashboard
+    // QR linking page. A QR code links whichever WhatsApp account scans it, so
+    // the page needs PAIR_PAGE_PASSWORD (the browser asks for it; any user name).
+    if (PAIRING_METHOD === 'qr' && (pathname === '/pair' || (pathname === '/' && req.headers.accept?.includes('text/html')))) {
+      const password = String(process.env.PAIR_PAGE_PASSWORD || '').trim();
+      if (password && !pairPasswordMatches(req.headers.authorization, password)) {
+        res.writeHead(401, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'WWW-Authenticate': 'Basic realm="Bot 2 pairing", charset="UTF-8"',
+          'Cache-Control': 'no-store',
+        });
+        res.end('Sign in with the PAIR_PAGE_PASSWORD set for this service on Render (any user name).');
+        return;
+      }
+      const target = pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256';
+      const qrFresh = Boolean(latestQr && Date.now() - latestQrAt < QR_FRESH_MS);
+      let body;
+      let refreshSeconds = 5;
+      if (!password) {
+        body = `<h1>Link Bot 2 to WhatsApp</h1><p>To show the QR code here, add a <b>PAIR_PAGE_PASSWORD</b> setting to this service on Render, then open this page again and sign in with it (any user name).</p>`;
+        refreshSeconds = 0;
+      } else if (whatsappConnected) {
+        body = `<h1>Bot 2 is connected ✓</h1><p>Linked to +${String(activeSocket?.user?.id || target).split(':')[0]}.</p>`;
+        refreshSeconds = 30;
+      } else if (qrFresh) {
+        body = `<h1>Link Bot 2 to WhatsApp</h1>${qrSvg(latestQr)}
+<p>On the phone with Bot 2's WhatsApp (+${target}), go to <b>Settings → Linked devices → Link a device</b> and scan this code.</p>
+<p class="small">The code changes every 20 seconds or so, and this page follows it. Another account's scan is refused.</p>`;
+      } else {
+        body = '<h1>Link Bot 2 to WhatsApp</h1><p>Getting a QR code from WhatsApp…</p>';
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ''}<title>Link Bot 2</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;text-align:center}main{max-width:520px;padding:24px}svg{width:min(80vw,380px);height:auto;border-radius:12px}p{line-height:1.5}.small{color:#94a3b8;font-size:14px}</style>
+</head><body><main>${body}</main></body></html>`);
+      return;
+    }
+
+    // Interactive web pairing dashboard (phone-number codes)
     if (pathname === '/pair' || (pathname === '/' && req.headers.accept?.includes('text/html'))) {
       const isConnected = whatsappConnected;
       const targetPhone = pairingTargetPhone || normalizeWhatsAppPhoneNumber(process.env.WHATSAPP_PHONE_NUMBER) || '2349061484256';

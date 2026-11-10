@@ -87,6 +87,10 @@ Open `/pair` on the Bot 2 service. On the WhatsApp account Bot 2 should use, go 
 
 The `/pair` page and Render logs show the active code. Use **Generate fresh code** only after the current code expires or WhatsApp rejects it; use **Reset pairing session** only after several failed fresh codes.
 
+### Linking on Render by QR code
+
+Bot 2 links by QR code by default (`WHATSAPP_PAIRING_METHOD=qr`). Set `PAIR_PAGE_PASSWORD` on Render, open `/pair` on the service and sign in with that password (any user name). Then, on the phone with Bot 2's WhatsApp, go to **Settings → Linked devices → Link a device** and scan the code; the page follows the code as it changes. A scan from any account other than `WHATSAPP_PHONE_NUMBER` is unlinked straight away. Set `WHATSAPP_PAIRING_METHOD=code` to go back to phone-number codes.
+
 ### Linking from your computer by QR code (most reliable)
 
 WhatsApp can refuse phone-number codes ("Couldn’t link device"). In November 2026 it refused them both on Render and from a computer, while a QR code scanned from a computer linked first time:

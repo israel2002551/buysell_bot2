@@ -34,6 +34,12 @@ services:
         sync: false
       - key: WHATSAPP_PHONE_NUMBER
         sync: false
+      # "qr": link by scanning a QR code on /pair (needs PAIR_PAGE_PASSWORD).
+      # "code": phone-number link codes, which WhatsApp refused in November 2026.
+      - key: WHATSAPP_PAIRING_METHOD
+        value: qr
+      - key: PAIR_PAGE_PASSWORD
+        sync: false
       - key: WHATSAPP_AUTH_STORE
         value: supabase
       - key: WHATSAPP_AUTH_SESSION_ID
