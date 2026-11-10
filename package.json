@@ -10,10 +10,9 @@
     "postinstall": "node scripts/patch-baileys-message-ack.js",
     "start": "node collector.js",
     "list-groups": "node list-groups.js",
-    "check": "node --check collector.js && node --check parser.js && node --check notifier.js && node --check cloudinary.js && node --check buysell-api.js && node --check queue.js && node --check auth-store.js && node --check upload-session.js && node --check seller-phone.js && node --check pair-qr.js",
-    "test": "node --test tests/collector-utils.test.js tests/auth-store.test.js tests/notifier.test.js tests/seller-phone.test.js",
-    "upload-session": "node upload-session.js",
-    "pair-qr": "node pair-qr.js"
+    "check": "node --check collector.js && node --check parser.js && node --check notifier.js && node --check cloudinary.js && node --check buysell-api.js && node --check queue.js && node --check auth-store.js && node --check upload-session.js",
+    "test": "node --test tests/collector-utils.test.js tests/auth-store.test.js tests/notifier.test.js",
+    "upload-session": "node upload-session.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",

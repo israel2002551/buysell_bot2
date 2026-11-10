@@ -20,11 +20,8 @@ import { BuySellListingsApi } from './buysell-api.js';
 import { sendSellerCommandResult, sendSellerConfirmation, sendSellerBatchConfirmation } from './notifier.js';
 import { KeyedTaskQueue } from './queue.js';
 import { authStoreMode, openAuthState } from './auth-store.js';
-import { SellerPhones, usablePhone } from './seller-phone.js';
 
 const api = new BuySellListingsApi();
-// Real numbers of sellers WhatsApp names only by a private ID (see seller-phone.js).
-const sellerPhones = new SellerPhones();
 const targetGroups = new Set();
 const reportedUnapprovedGroups = new Set();
 const groupRefreshMs = Math.max(300_000, Number(process.env.WHATSAPP_GROUP_REFRESH_MS || 600_000));
@@ -314,12 +311,12 @@ function startKeepAlive(sock) {
   }, 30_000);
 }
 
-function scheduleReconnect(immediate = false, delayMs = null) {
+function scheduleReconnect(immediate = false) {
   if (reconnectTimer) return;
 
   // Delays with exponential backoff: 1s (immediate/515 restart), 3s, 5s, 10s, 20s, 30s, up to 60s
   const delays = [3_000, 5_000, 10_000, 20_000, 30_000, 60_000];
-  const delay = delayMs ?? (immediate ? 1_000 : delays[Math.min(reconnectAttempts, delays.length - 1)]);
+  const delay = immediate ? 1_000 : delays[Math.min(reconnectAttempts, delays.length - 1)];
 
   console.info(`[Bot 2] WhatsApp reconnect scheduled in ${(delay / 1000).toFixed(0)}s (retry attempt #${reconnectAttempts + 1})...`);
 
@@ -463,6 +460,11 @@ function sourceId(groupJid, senderJid, messageIds, index = 0) {
   return index > 0 ? `wa_vis_${digest}_${index}` : `wa_vis_${digest}`;
 }
 
+function rawPhone(senderJid) {
+  const number = String(senderJid || '').split('@')[0].replace(/\D/g, '');
+  return number || null;
+}
+
 function normalizeWhatsAppPhoneNumber(raw) {
   let cleaned = String(raw || '').replace(/\D/g, '');
   if (!cleaned) return '';
@@ -507,11 +509,6 @@ async function processListing(bundle, sock) {
 
   console.info(`[Vision Found] Detected ${validItems.length} product(s) from ${bundle.senderJid}`);
 
-  // The seller's WhatsApp number (never their private ID's digits), else a number from the post.
-  const whatsappPhone = usablePhone(bundle.senderPhone, bundle.senderJid)
-    || await sellerPhones.lookup(sock, bundle.groupJid, bundle.senderJid);
-  const sellerPhone = whatsappPhone || usablePhone(parsed.seller_phone, bundle.senderJid);
-
   // Media has already been saved before this durable job was enqueued. This
   // keeps retries independent of WhatsApp's expiring media download links.
   const uploadedMedia = (bundle.media || []).filter(item => item?.url && item?.type);
@@ -545,7 +542,7 @@ async function processListing(bundle, sock) {
         source_message_id: itemSourceId,
         group_jid: bundle.groupJid,
         sender_jid: bundle.senderJid,
-        sender_phone: sellerPhone,
+        sender_phone: parsed.seller_phone || rawPhone(bundle.senderJid),
         manage_token: manageToken,
         title: finalTitle,
         description: finalDescription,
@@ -666,7 +663,7 @@ function queueBundleForStaging(bundle) {
       dedupe_key: sourceKey,
       group_jid: bundle.groupJid,
       sender_jid: bundle.senderJid,
-      sender_phone: await sellerPhones.lookup(activeSocket, bundle.groupJid, bundle.senderJid),
+      sender_phone: rawPhone(bundle.senderJid),
       message_ids: [...new Set(bundle.messageIds || [])],
       payload: {
         text: bundle.text || '',
@@ -693,36 +690,12 @@ function listingRetryDelaySeconds(attempt) {
   return exponential + Math.floor(Math.random() * 15);
 }
 
-// Once per run: sellers BUYSELL knows only by a private ID get their real
-// numbers from the member lists of the bot's groups, where WhatsApp shows them,
-// so order alerts can link to a chat with the seller.
-let sellerPhonesFilled = false;
-async function fillInSellerPhones(sock) {
-  if (sellerPhonesFilled) return;
-  sellerPhonesFilled = true;
-  try {
-    const { sender_jids: missing = [] } = await api.sellerPhones({ mode: 'missing' });
-    if (!missing.length) return;
-    const groups = await sock.groupFetchAllParticipating();
-    for (const group of Object.values(groups || {})) sellerPhones.rememberMembers(group?.participants);
-    const phones = missing
-      .map(senderJid => ({ sender_jid: senderJid, phone: sellerPhones.known(senderJid) }))
-      .filter(entry => entry.phone);
-    const saved = phones.length ? await api.sellerPhones({ mode: 'save', phones }) : { updated: 0 };
-    console.info(`[Seller phones] Found the numbers of ${phones.length} of ${missing.length} sellers known only by a private ID; updated ${saved?.updated ?? 0} listings.`);
-  } catch (error) {
-    sellerPhonesFilled = false;
-    console.warn('[Seller phones] Could not fill in seller numbers:', error?.message || error);
-  }
-}
-
 async function processClaimedListingJob(job) {
   const payload = job?.payload && typeof job.payload === 'object' ? job.payload : {};
   const media = Array.isArray(payload.media) ? payload.media : [];
   const bundle = {
     groupJid: job.group_jid,
     senderJid: job.sender_jid,
-    senderPhone: job.sender_phone || null,
     messageIds: Array.isArray(job.message_ids) ? job.message_ids : [],
     sourceKey: job.dedupe_key,
     text: String(payload.text || ''),
@@ -1096,7 +1069,6 @@ function onMessage(sock, message) {
   const senderJid = isFromMe
     ? (myJid || message?.key?.participant || remoteJid)
     : (message?.key?.participant || remoteJid);
-  sellerPhones.rememberMessage(message, senderJid);
 
   const details = mediaDetails(message);
 
@@ -1250,9 +1222,6 @@ async function startVisionCollector() {
         sock.sendPresenceUpdate('available').catch(() => {});
         startKeepAlive(sock);
         startListingQueuePolling();
-        setTimeout(() => {
-          if (activeSocket === sock && whatsappConnected) void fillInSellerPhones(sock);
-        }, 20_000);
       }
       if (connection === 'close') {
         await credsSavePromise;
@@ -1278,13 +1247,6 @@ async function startVisionCollector() {
         } else if (isRestartRequired) {
           console.info('[Bot 2] Restart required by WhatsApp. Reconnecting immediately...');
           scheduleReconnect(true);
-        } else if (code === DisconnectReason.connectionReplaced) {
-          // Another copy of Bot 2 took over this WhatsApp session, usually the new
-          // copy started by a deploy while this one still runs. Reconnecting at once
-          // makes the two fight over one session until WhatsApp logs the device out
-          // (which wipes the stored session), so give the other copy time to stop.
-          console.warn('[Bot 2] Another copy of Bot 2 took over the WhatsApp connection. Reconnecting in 3 minutes.');
-          scheduleReconnect(false, 3 * 60_000);
         } else {
           reconnectAttempts++;
           scheduleReconnect(false);
