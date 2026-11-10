@@ -94,6 +94,12 @@ export class BuySellListingsApi {
     return this.request({ action: 'seller_catalog_link', sender_jid: senderJid });
   }
 
+  // Sellers known only by a private ID: { mode: 'missing' } lists them, and
+  // { mode: 'save', phones: [{ sender_jid, phone }] } saves their real numbers.
+  sellerPhones(body) {
+    return this.request({ action: 'seller_phones', ...body });
+  }
+
   listTargetGroups() {
     return this.request({ action: 'collector_groups' });
   }

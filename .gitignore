@@ -5,3 +5,7 @@ wa_vision_auth_session/
 wa_auth_session/
 *.log
 .DS_Store
+
+# WhatsApp sessions under any folder name hold the account’s keys; never commit them.
+wa_*session*/
+pairing-qr.html

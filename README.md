@@ -87,6 +87,18 @@ Open `/pair` on the Bot 2 service. On the WhatsApp account Bot 2 should use, go 
 
 The `/pair` page and Render logs show the active code. Use **Generate fresh code** only after the current code expires or WhatsApp rejects it; use **Reset pairing session** only after several failed fresh codes.
 
+### Linking from your computer by QR code (most reliable)
+
+WhatsApp can refuse phone-number codes ("Couldn’t link device"). In November 2026 it refused them both on Render and from a computer, while a QR code scanned from a computer linked first time:
+
+1. Suspend Bot 2 on Render, and stop any local `npm start`, so only one copy uses the session.
+2. In this folder, with your `.env` in place, run `npm run pair-qr`. A page with a QR code opens in your browser.
+3. On the phone, in the WhatsApp account Bot 2 should use, go to **Settings → Linked devices → Link a device** and scan the code. The script saves the session to `SESSION_DIR` and stops.
+4. Upload it for Render with `node upload-session.js --replace`. Your `.env` needs `WHATSAPP_AUTH_SESSION_ID=bot2` and the same `WHATSAPP_AUTH_ENCRYPTION_KEY` as Render.
+5. On Render, set `WHATSAPP_AUTH_STORE=supabase`, `WHATSAPP_AUTH_SESSION_ID=bot2` and that key, then resume the service.
+
+After that, don’t use **New Code** or **Reset pairing session** on `/pair`: they wipe the linked session.
+
 ## WhatsApp session safety
 
 The Baileys authentication directory contains Signal session credentials and must never be committed, logged, or shared. Set `SESSION_DIR` to a persistent disk location in production and run only one collector instance against that directory. If WhatsApp reports repeated `Bad MAC` or session errors, unlink the Bot 2 device in WhatsApp, remove only the collector's old authentication directory, then pair once again. The collector redacts Signal-library session dumps and protects against concurrent reconnects, but a compromised or out-of-sync credential store still needs a clean re-pair.
