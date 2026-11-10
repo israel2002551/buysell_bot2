@@ -1207,6 +1207,10 @@ async function startVisionCollector() {
       browser: Browsers.macOS('Chrome'),
       markOnlineOnConnect: true,
       syncFullHistory: false,
+      // Bot 2 only reads new group posts. Downloading chat history after each
+      // connect also starts a full app state sync, which holds up every incoming
+      // message (see scripts/patch-baileys-message-ack.js).
+      shouldSyncHistoryMessage: () => false,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 25_000,
@@ -1296,6 +1300,14 @@ async function startVisionCollector() {
         const isRestartRequired = code === DisconnectReason.restartRequired;
 
         console.warn(`[Bot 2] WhatsApp connection closed (code: ${code ?? 'unknown'}, reason: ${lastDisconnect?.error?.message || 'unknown'}).`);
+        // A stream error names what WhatsApp objected to, e.g. which stanza went unacknowledged.
+        const streamError = lastDisconnect?.error?.data;
+        if (streamError?.tag === 'stream:error') {
+          const detail = (Array.isArray(streamError.content) ? streamError.content : [])
+            .map(child => `<${child?.tag} ${JSON.stringify(child?.attrs || {})}>`)
+            .join(' ');
+          console.warn(`[Bot 2] WhatsApp stream error detail: ${JSON.stringify(streamError.attrs || {})} ${detail}`.trim());
+        }
 
         if (activeSocket === sock) {
           activeSocket = null;

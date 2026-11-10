@@ -10,6 +10,14 @@ import { dirname, resolve } from 'node:path';
 // The second patch acknowledges a message whose handling throws (for example a
 // stale Signal session or a failed receipt). Baileys only logs that error, so
 // the message was never acknowledged and WhatsApp closed the stream the same way.
+//
+// The third patch stops `server_sync` notices from rebuilding WhatsApp's app
+// state (archived/muted/pinned chats, contact names), which Bot 2 never uses.
+// Baileys rebuilds the whole collection inside the lock that every incoming
+// message waits on, and acknowledges the notice only when it is done. On 10 Nov
+// 2026 the large collections never finished on Render's small instance:
+// WhatsApp closed the stream for the missing ack, resent the notice on reconnect,
+// and Bot 2 read no messages for six hours. The notice is now acknowledged at once.
 const here = dirname(fileURLToPath(import.meta.url));
 const packageDir = resolve(here, '..', 'node_modules', '@whiskeysockets', 'baileys');
 const target = resolve(packageDir, 'lib', 'Socket', 'messages-recv.js');
@@ -27,6 +35,11 @@ const patches = [
     name: 'acknowledge messages whose handling failed',
     before: "        catch (error) {\n            logger.error({ error, node }, 'error in handling message');\n        }",
     after: "        catch (error) {\n            logger.error({ error, node }, 'error in handling message');\n            if (!node.buysellAcked) {\n                await sendMessageAck(node).catch(() => { });\n            }\n        }",
+  },
+  {
+    name: 'skip app state resyncs on server_sync notices',
+    before: "                if (update) {\n                    const name = update.attrs.name;\n                    await resyncAppState([name], false);\n                }",
+    after: "                if (update) {\n                    logger.debug({ name: update.attrs.name }, 'buysell: app state resync skipped');\n                }",
   },
 ];
 
@@ -51,4 +64,4 @@ for (const patch of patches) {
 
 writeFileSync(target, source, 'utf8');
 writeFileSync(marker, 'BUYSELL Baileys message acknowledgement patch applied\n', 'utf8');
-console.info('[postinstall] Restored Baileys acknowledgement for decrypted and failed messages.');
+console.info('[postinstall] Patched Baileys: acknowledge decrypted and failed messages; skip app state resyncs.');
