@@ -16,7 +16,7 @@ An intelligent WhatsApp collector bot for **BUYSELL Nigeria** powered by **Groq 
 - **Smart Follow-Up Buffering:** If a seller posts photos first and sends the price a few seconds later, the bot buffers the photos, joins them with the follow-up price, and processes them as one complete listing.
 - **Cloudinary Image Hosting:** Automatically optimizes and uploads WhatsApp images directly to Cloudinary.
 - **Direct Marketplace Ingestion:** Publishes approved listings straight into the BUYSELL Supabase catalog.
-- **Consolidated Seller Feedback:** Automatically DMs the seller with a consolidated summary of their uploaded products and management links (replying `SOLD` or `DELETE` marks the latest listing sold).
+- **Consolidated Seller Feedback:** Automatically DMs the seller a summary of their uploaded products with one link to all their items on BUYSELL (`/manage?catalog=…`, the same link every time), where they can search them, see the photos, and edit, mark sold or remove each one. Replying `SOLD` or `DELETE` marks the latest listing sold. If the link can't be fetched, the message falls back to each item's own management link.
 - **Keep-Alive Health Check:** Built-in HTTP server on `PORT` for 24/7 uptime monitoring with UptimeRobot.
 
 ---
