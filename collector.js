@@ -21,6 +21,7 @@ import { KeyedTaskQueue } from './queue.js';
 import { authStoreMode, openAuthState } from './auth-store.js';
 import { SellerPhones, usablePhone } from './seller-phone.js';
 import { pairPasswordMatches, qrSvg } from './pair-page.js';
+import { acknowledgeStatusUpdates } from './status-acks.js';
 
 const api = new BuySellListingsApi();
 // Real numbers of sellers WhatsApp names only by a private ID (see seller-phone.js).
@@ -1226,6 +1227,7 @@ async function startVisionCollector() {
       },
     });
     activeSocket = sock;
+    acknowledgeStatusUpdates(sock);
     let credsSavePromise = Promise.resolve();
     let pairingCodeRequestedOnSocket = false;
     const pairingCodeForReconnect = canReuseActivePairingCode(phoneNumber) ? activePairingCodeRaw : null;
