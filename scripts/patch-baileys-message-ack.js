@@ -41,6 +41,14 @@ const patches = [
     before: "                if (update) {\n                    const name = update.attrs.name;\n                    await resyncAppState([name], false);\n                }",
     after: "                if (update) {\n                    logger.debug({ name: update.attrs.name }, 'buysell: app state resync skipped');\n                }",
   },
+  {
+    // One item that throws used to end the loop that works through the messages
+    // and receipts WhatsApp delivers after a reconnect; everything behind it then
+    // went unprocessed and unacknowledged until the next disconnect.
+    name: 'keep processing offline items after one fails',
+    before: "                    await nodeProcessor(node);\n                }\n                isProcessing = false;",
+    after: "                    await nodeProcessor(node).catch(error => onUnexpectedError(error, 'processing offline node'));\n                }\n                isProcessing = false;",
+  },
 ];
 
 if (!existsSync(target)) {
@@ -64,4 +72,4 @@ for (const patch of patches) {
 
 writeFileSync(target, source, 'utf8');
 writeFileSync(marker, 'BUYSELL Baileys message acknowledgement patch applied\n', 'utf8');
-console.info('[postinstall] Patched Baileys: acknowledge decrypted and failed messages; skip app state resyncs.');
+console.info('[postinstall] Patched Baileys: acknowledge decrypted and failed messages; skip app state resyncs; keep offline processing going.');

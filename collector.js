@@ -1216,7 +1216,10 @@ async function startVisionCollector() {
       keepAliveIntervalMs: 25_000,
       retryRequestDelayMs: 5_000,
       msgRetryCounterCache: messageRetryCounterCache,
-      shouldIgnoreJid: (jid) => jid.endsWith('@broadcast') || jid.endsWith('@newsletter'),
+      // Baileys also calls this with no JID: a "peer_msg" receipt from Bot 2's own
+      // phone has no recipient. Throwing there skipped the receipt's acknowledgement,
+      // and WhatsApp closed the connection with "Stream Errored (ack)".
+      shouldIgnoreJid: (jid) => typeof jid === 'string' && (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')),
       getMessage: async (key) => {
         const msg = messageStore.get(key.id);
         return msg?.message || undefined;
