@@ -63,9 +63,11 @@ const mediaIntakeConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_
 const stagingConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_STAGING_CONCURRENCY || 2), 4));
 const listingWorkerConcurrency = Math.max(1, Math.min(Number(process.env.WHATSAPP_LISTING_WORKER_CONCURRENCY || 1), 3));
 
-// Adaptive polling: poll every 3-4s when work is active; back off to 25s when idle (saves ~90% of polling bandwidth)
+// Job checks: every 4s while there is work, backing off to once a minute when
+// idle. Bot 2 queues its own jobs and checks straight away when it does, so the
+// idle check only picks up retries. Every check is a logged Supabase request.
 const activePollMs = Math.max(2_000, Number(process.env.WHATSAPP_QUEUE_POLL_MS || 4_000));
-const idlePollMs = Math.max(10_000, Number(process.env.WHATSAPP_IDLE_POLL_MS || 25_000));
+const idlePollMs = Math.max(10_000, Number(process.env.WHATSAPP_IDLE_POLL_MS || 60_000));
 let currentPollIntervalMs = idlePollMs;
 
 const priceFollowUpWindowMs = Math.max(60_000, Number(process.env.WHATSAPP_PRICE_FOLLOWUP_WINDOW_MS || 10 * 60_000));
@@ -790,10 +792,26 @@ async function pumpListingJobs() {
   return hadWork;
 }
 
+// There is only ever one job-check loop. A wake-up while a check is running
+// asks for another check right after it, rather than starting a second loop.
+// Before, each new or finished job could start an extra loop that never
+// stopped; by November 2026 they added up to about 85 checks a minute and
+// pushed Supabase past its free log allowance.
+let listingPollRunning = false;
+let listingPollRequested = false;
+
+function scheduleQueuePoll(delayMs) {
+  if (listingQueuePollTimer) clearTimeout(listingQueuePollTimer);
+  listingQueuePollTimer = setTimeout(runQueuePollStep, delayMs);
+}
+
 function wakeQueuePump() {
   currentPollIntervalMs = activePollMs;
-  if (listingQueuePollTimer) clearTimeout(listingQueuePollTimer);
-  listingQueuePollTimer = setTimeout(runQueuePollStep, 50);
+  if (listingPollRunning) {
+    listingPollRequested = true;
+    return;
+  }
+  scheduleQueuePoll(50);
 }
 
 function scheduleListingJobPump() {
@@ -802,19 +820,27 @@ function scheduleListingJobPump() {
 
 async function runQueuePollStep() {
   listingQueuePollTimer = null;
-  const hadWork = await pumpListingJobs();
-  if (hadWork) {
+  if (listingPollRunning) return;
+  listingPollRunning = true;
+  listingPollRequested = false;
+  let hadWork = false;
+  try {
+    hadWork = await pumpListingJobs();
+  } finally {
+    listingPollRunning = false;
+  }
+  if (hadWork || listingPollRequested) {
     currentPollIntervalMs = activePollMs;
   } else {
-    // Smooth exponential backoff to reduce idle bandwidth by ~90%
     currentPollIntervalMs = Math.min(idlePollMs, Math.round(currentPollIntervalMs * 1.5));
   }
-  listingQueuePollTimer = setTimeout(runQueuePollStep, currentPollIntervalMs);
+  scheduleQueuePoll(listingPollRequested ? 50 : currentPollIntervalMs);
+  listingPollRequested = false;
 }
 
 function startListingQueuePolling() {
-  if (listingQueuePollTimer) return;
-  runQueuePollStep();
+  if (listingQueuePollTimer || listingPollRunning) return;
+  scheduleQueuePoll(0);
 }
 
 function recentCandidates(key) {

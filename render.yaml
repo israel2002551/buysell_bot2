@@ -59,7 +59,7 @@ services:
       - key: WHATSAPP_QUEUE_POLL_MS
         value: "4000"
       - key: WHATSAPP_IDLE_POLL_MS
-        value: "25000"
+        value: "60000"
       - key: WHATSAPP_GROUP_REFRESH_MS
         value: "600000"
       - key: WHATSAPP_PRICE_FOLLOWUP_WINDOW_MS
